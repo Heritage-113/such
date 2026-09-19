@@ -1,0 +1,38 @@
+name: Commit release ZIP
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/commit-release-zip.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  commit-release-zip:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - name: Download release ZIP
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ASSET: Such_v0.6.2_Public_GitHubReady_SourceOnly.zip
+        run: |
+          gh release download Zip --repo "$GITHUB_REPOSITORY" --pattern "$ASSET" --dir . --clobber
+          test -f "$ASSET"
+      - name: Commit ZIP
+        env:
+          ASSET: Such_v0.6.2_Public_GitHubReady_SourceOnly.zip
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "$ASSET"
+          if git diff --cached --quiet; then
+            exit 0
+          fi
+          git commit -m "Add Such v0.6.2 source package [skip ci]"
+          git push origin HEAD:main
