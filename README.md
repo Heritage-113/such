@@ -4,6 +4,8 @@
 
 Such is a native local-search tool by Heritage Inc. Desktop support is **Windows x64 and Linux x64**. macOS desktop is not supported.
 
+https://such.heritage-labs.net
+
 ## CLI
 
 Windows uses `SuchCLI`; Linux uses `such`.
