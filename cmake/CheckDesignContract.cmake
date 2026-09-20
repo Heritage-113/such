@@ -6,7 +6,7 @@ if(NOT EXISTS "${_such_design_file}")
   message(FATAL_ERROR "Such design authority missing: docs/Design.md")
 endif()
 file(SHA256 "${_such_design_file}" _such_design_sha256)
-set(_such_design_expected "19d4fcc8177796c52674c3c771e43e212cd9e43996d7a8846052ba6eb0b24200")
+set(_such_design_expected "2c17b7338efec9351eba507f17cddbca3319829d7684dc599a5078f170780913")
 if(NOT _such_design_sha256 STREQUAL _such_design_expected)
   message(FATAL_ERROR
     "docs/Design.md changed without updating the authoritative design gate.\n"
