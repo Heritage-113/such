@@ -5,6 +5,11 @@ on:
     branches: [main]
     paths:
       - .github/workflows/oss-policy-smoke.yml
+      - scripts/build_deb.sh
+      - CMakeLists.txt
+      - LICENSE
+      - NOTICE
+      - .runtime/NOTICE.txt
 
 permissions:
   contents: read
@@ -44,9 +49,8 @@ jobs:
           from pathlib import Path
           license_text = Path('/tmp/such-deb-policy/usr/share/doc/such/LICENSE').read_text(encoding='utf-8', errors='replace')
           runtime_notice = Path('/tmp/such-deb-policy/usr/share/doc/such/runtime/HERITAGE_RUNTIME_NOTICE.txt').read_text(encoding='utf-8', errors='replace')
-          print('--- runtime notice in DEB ---')
-          print(runtime_notice)
           assert 'Apache License' in license_text
           assert 'NOT licensed under the Apache License' in runtime_notice
           assert 'private Such SDK' in runtime_notice
+          print('Debian legal payload PASS')
           PY
