@@ -41,7 +41,7 @@ jobs:
           test -f /tmp/such-deb-policy/usr/share/doc/such/NOTICE
           test -f /tmp/such-deb-policy/usr/share/doc/such/runtime/HERITAGE_RUNTIME_NOTICE.txt
           grep -q 'Apache License' /tmp/such-deb-policy/usr/share/doc/such/LICENSE
-          grep -q 'NOT licensed under the Apache License' /tmp/such-deb-policy/usr/share/doc/such/runtime/HERITAGE_RUNTIME_NOTICE.txt
+          grep -Eqi 'NOT licensed under the Apache License|not licensed under.*Apache License' /tmp/such-deb-policy/usr/share/doc/such/runtime/HERITAGE_RUNTIME_NOTICE.txt
 
   windows:
     runs-on: windows-2022
@@ -65,3 +65,4 @@ jobs:
           if ($null -eq $notice) { throw 'NOTICE missing from Windows release' }
           if ($null -eq $runtimeNotice) { throw 'runtime notice missing from Windows release' }
           if (-not (Select-String -LiteralPath $license.FullName -Pattern 'Apache License' -Quiet)) { throw 'Apache license text missing' }
+          if (-not (Select-String -LiteralPath $runtimeNotice.FullName -Pattern 'NOT licensed under the Apache License' -Quiet)) { throw 'runtime license boundary notice missing' }
