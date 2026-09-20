@@ -5,6 +5,5 @@
 *.suo
 .DS_Store
 
-# Local proprietary runtime injection area. Never publish this in the public repository.
-/.runtime/
-
+# Such v1.0 ships the approved Windows/Linux runtime artifacts in-repo.
+# Do not ignore /.runtime/.
