@@ -115,4 +115,20 @@ The v1.0 repository/release carries the approved desktop runtime artifacts used 
 
 `build_linux.sh` accepts `RUNTIME_LIBRARY_PATH=/absolute/path/libSuchRuntimePrivate.so` and otherwise discovers the tracked Linux runtime under `.runtime/`. Approved hashes remain pinned in `runtime/RUNTIME_SHA256_v1.0.0.txt`. Linux legal notices are included with the Linux package.
 
+## SDK and commercial integration
+
+The **Such SDK is private** and is not distributed through this public repository. If you need to embed Such search into another native application, integrate the private runtime, or discuss commercial deployment/support, contact Heritage Inc. through:
+
+https://heritage-labs.net
+
+The public repository intentionally exposes only the stable public runtime boundary required by Such itself. Publication of that boundary does not publish the private SDK or production search/storage implementation.
+
+## Open-source license
+
+The public Such source code, documentation, and public build tooling are licensed under the **Apache License, Version 2.0**. See [`LICENSE`](LICENSE) and [`NOTICE`](NOTICE).
+
+The production runtime binaries under `.runtime/` are **not licensed under Apache-2.0** and remain separate Heritage Inc. artifacts subject to separate terms. The private Such SDK is likewise outside the public Apache-2.0 grant.
+
+Contributions are governed by [`CONTRIBUTING.md`](CONTRIBUTING.md). Security issues should be reported according to [`SECURITY.md`](SECURITY.md). The public/private component boundary is documented in [`docs/PUBLIC_BOUNDARY.md`](docs/PUBLIC_BOUNDARY.md).
+
 **2026 Heritage Inc.**
