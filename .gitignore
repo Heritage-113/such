@@ -1,0 +1,10 @@
+/build/
+/dist/
+/.cache/
+*.user
+*.suo
+.DS_Store
+
+# Local proprietary runtime injection area. Never publish this in the public repository.
+/.runtime/
+

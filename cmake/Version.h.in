@@ -1,0 +1,10 @@
+#pragma once
+
+#include <string_view>
+
+namespace such::version {
+inline constexpr std::string_view kVersion = "@PROJECT_VERSION@";
+inline constexpr std::string_view kProductName = "Such";
+inline constexpr std::string_view kDisplayName = "Such v@PROJECT_VERSION@";
+inline constexpr int kBuildNumber = 100;
+} // namespace such::version

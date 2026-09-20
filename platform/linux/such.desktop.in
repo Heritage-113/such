@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Such
+Comment=Local file search
+Exec=such
+Icon=such
+Terminal=false
+Categories=Utility;FileTools;
+StartupNotify=true
