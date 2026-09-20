@@ -1,0 +1,28 @@
+name: Windows VS2022 build validation
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/windows-vs2022-smoke.yml
+
+permissions:
+  contents: read
+
+jobs:
+  windows-vs2022:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Doctor VS2022
+        shell: cmd
+        run: scripts\doctor_windows.cmd -Generator "Visual Studio 17 2022"
+      - name: Build clean VS2022
+        shell: cmd
+        run: scripts\build_windows.cmd -Clean -Generator "Visual Studio 17 2022"
+      - name: Verify clean VS2022
+        shell: cmd
+        run: scripts\verify_windows.cmd -Clean -Generator "Visual Studio 17 2022"
+      - name: Release clean VS2022
+        shell: cmd
+        run: scripts\release_windows.cmd -Clean -Generator "Visual Studio 17 2022"
