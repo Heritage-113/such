@@ -1,0 +1,38 @@
+SuchRuntimePrivate v0.6.2 — Binary Distribution Legal Notice
+Copyright (c) 2026 Heritage Inc. All rights reserved.
+
+This package contains the SuchRuntimePrivate binary and includes TopoDB components
+licensed under the Apache License, Version 2.0.
+
+IMPORTANT LICENSE NOTICE
+
+Apache License 2.0 permits use, modification, refactoring, and redistribution of
+Apache-2.0-covered material, subject to the license conditions. Refactoring by
+itself is not a violation of Apache License 2.0.
+
+However, if you redistribute Apache-2.0-covered material or a derivative work,
+with or without modifications, you must comply with the applicable Apache-2.0
+requirements. These include, as applicable:
+
+  • providing recipients with a copy of the Apache License 2.0;
+  • marking modified files with prominent notices stating that changes were made;
+  • retaining applicable copyright, patent, trademark, and attribution notices;
+  • preserving the substance of applicable NOTICE attributions in distributions.
+
+Removing required license or attribution material, concealing modifications where
+notice is required, or redistributing covered material without satisfying the
+Apache-2.0 conditions may constitute a license violation and may terminate the
+permissions granted by that license.
+
+The Apache License 2.0 applies only to components expressly identified as being
+licensed under it. SuchRuntimePrivate components not expressly identified as
+Apache-2.0 material are not relicensed under Apache-2.0 merely because they are
+linked with or distributed alongside Apache-2.0 components. No additional rights
+are granted to Heritage Inc. proprietary material by this notice.
+
+See:
+  licenses/TopoDB-Apache-2.0-LICENSE.txt
+  licenses/TopoDB-NOTICE.txt
+
+This notice is informational and does not replace the text of the applicable
+license.
