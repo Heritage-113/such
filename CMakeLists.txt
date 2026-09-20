@@ -183,6 +183,20 @@ endif()
 install(TARGETS such_public_core EXPORT SuchPublicTargets ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR} LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR} INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 install(FILES "${SUCH_GENERATED_INCLUDE_DIR}/such/Version.h" DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/such")
+
+# Ship the public Apache-2.0 grant and attribution notice with every installed
+# desktop payload. Release scripts package the install staging tree, so keeping
+# this responsibility here prevents Windows/Linux/DEB packaging drift.
+install(FILES
+  "${CMAKE_CURRENT_SOURCE_DIR}/LICENSE"
+  "${CMAKE_CURRENT_SOURCE_DIR}/NOTICE"
+  DESTINATION "${CMAKE_INSTALL_DATADIR}/doc/such")
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/.runtime/NOTICE.txt")
+  install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/.runtime/NOTICE.txt"
+    DESTINATION "${CMAKE_INSTALL_DATADIR}/doc/such/runtime"
+    RENAME "HERITAGE_RUNTIME_NOTICE.txt")
+endif()
+
 set(_pkg "${CMAKE_INSTALL_LIBDIR}/cmake/SuchPublic")
 configure_package_config_file(cmake/SuchPublicConfig.cmake.in "${CMAKE_CURRENT_BINARY_DIR}/SuchPublicConfig.cmake" INSTALL_DESTINATION "${_pkg}")
 write_basic_package_version_file("${CMAKE_CURRENT_BINARY_DIR}/SuchPublicConfigVersion.cmake" VERSION "${PROJECT_VERSION}" COMPATIBILITY SameMajorVersion)
