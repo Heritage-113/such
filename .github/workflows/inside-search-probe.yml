@@ -4,6 +4,9 @@ on:
   push:
     branches:
       - dev/inside-search
+  pull_request:
+    branches:
+      - main
   workflow_dispatch:
 
 jobs:
