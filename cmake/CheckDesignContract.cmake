@@ -1,16 +1,13 @@
-# Authoritative UI/UX contract integrity gate.
-# If docs/Design.md is intentionally revised, update the expected hash in the same change
-# and re-audit all frontend contract tests.
+# Authoritative UI/UX contract checks used during configure.
+#
+# Do not byte-hash text documentation here. Git checkouts may represent the
+# same text with LF or CRLF line endings, especially on Windows. Exact/canonical
+# Design.md integrity belongs to the repository audits, which normalize line
+# endings before hashing. Configure is responsible for build-relevant semantic
+# checks only.
 set(_such_design_file "${CMAKE_CURRENT_LIST_DIR}/../docs/Design.md")
 if(NOT EXISTS "${_such_design_file}")
   message(FATAL_ERROR "Such design authority missing: docs/Design.md")
-endif()
-file(SHA256 "${_such_design_file}" _such_design_sha256)
-set(_such_design_expected "2c17b7338efec9351eba507f17cddbca3319829d7684dc599a5078f170780913")
-if(NOT _such_design_sha256 STREQUAL _such_design_expected)
-  message(FATAL_ERROR
-    "docs/Design.md changed without updating the authoritative design gate.\n"
-    "Expected: ${_such_design_expected}\nActual:   ${_such_design_sha256}")
 endif()
 
 # The flat placeholder UI from the failed handoff must never re-enter a platform shell.
@@ -36,7 +33,7 @@ foreach(_src
   endif()
 endforeach()
 
-message(STATUS "Such authoritative Design.md: PASS (${_such_design_sha256})")
+message(STATUS "Such design authority: present; semantic frontend checks PASS")
 
 # Canonical app-icon assets must ship with the SourceOnly tree.
 foreach(_icon
@@ -49,8 +46,9 @@ foreach(_icon
   endif()
 endforeach()
 
-# The canonical uploaded artwork is immutable. Derived platform assets may be
-# regenerated, but the two source files must remain byte-for-byte identical.
+# Canonical uploaded artwork is binary and therefore safe to verify byte-for-byte.
+# Derived platform assets may be regenerated, but these source files must remain
+# identical.
 file(SHA256 "${CMAKE_CURRENT_LIST_DIR}/../assets/icon/SuchLogoOriginal.png" _such_logo_png_sha)
 if(NOT _such_logo_png_sha STREQUAL "b0d82ed475c96930fc018bad7931a8c25f5a7f8ec1e320268fe7aac88cc01b4d")
   message(FATAL_ERROR "Canonical SuchLogoOriginal.png changed unexpectedly: ${_such_logo_png_sha}")
