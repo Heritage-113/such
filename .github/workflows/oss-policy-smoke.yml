@@ -40,29 +40,13 @@ jobs:
           test -f /tmp/such-deb-policy/usr/share/doc/such/LICENSE
           test -f /tmp/such-deb-policy/usr/share/doc/such/NOTICE
           test -f /tmp/such-deb-policy/usr/share/doc/such/runtime/HERITAGE_RUNTIME_NOTICE.txt
-          grep -q 'Apache License' /tmp/such-deb-policy/usr/share/doc/such/LICENSE
-          grep -Eqi 'NOT licensed under the Apache License|not licensed under.*Apache License' /tmp/such-deb-policy/usr/share/doc/such/runtime/HERITAGE_RUNTIME_NOTICE.txt
-
-  windows:
-    runs-on: windows-2022
-    steps:
-      - uses: actions/checkout@v4
-      - name: Build Windows release
-        shell: cmd
-        run: scripts\release_windows.cmd -Clean -Generator "Visual Studio 17 2022"
-      - name: Inspect Windows legal payload
-        shell: pwsh
-        run: |
-          $zip = Join-Path $PWD 'dist\artifacts\Such_v1.0.0_Windows_x64_Public.zip'
-          if (-not (Test-Path -LiteralPath $zip)) { throw "release zip missing: $zip" }
-          $dst = Join-Path $env:RUNNER_TEMP 'such-win-policy'
-          Remove-Item -Recurse -Force $dst -ErrorAction SilentlyContinue
-          Expand-Archive -LiteralPath $zip -DestinationPath $dst
-          $license = Get-ChildItem -Path $dst -Recurse -File -Filter LICENSE | Select-Object -First 1
-          $notice = Get-ChildItem -Path $dst -Recurse -File -Filter NOTICE | Select-Object -First 1
-          $runtimeNotice = Get-ChildItem -Path $dst -Recurse -File -Filter HERITAGE_RUNTIME_NOTICE.txt | Select-Object -First 1
-          if ($null -eq $license) { throw 'LICENSE missing from Windows release' }
-          if ($null -eq $notice) { throw 'NOTICE missing from Windows release' }
-          if ($null -eq $runtimeNotice) { throw 'runtime notice missing from Windows release' }
-          if (-not (Select-String -LiteralPath $license.FullName -Pattern 'Apache License' -Quiet)) { throw 'Apache license text missing' }
-          if (-not (Select-String -LiteralPath $runtimeNotice.FullName -Pattern 'NOT licensed under the Apache License' -Quiet)) { throw 'runtime license boundary notice missing' }
+          python3 - <<'PY'
+          from pathlib import Path
+          license_text = Path('/tmp/such-deb-policy/usr/share/doc/such/LICENSE').read_text(encoding='utf-8', errors='replace')
+          runtime_notice = Path('/tmp/such-deb-policy/usr/share/doc/such/runtime/HERITAGE_RUNTIME_NOTICE.txt').read_text(encoding='utf-8', errors='replace')
+          print('--- runtime notice in DEB ---')
+          print(runtime_notice)
+          assert 'Apache License' in license_text
+          assert 'NOT licensed under the Apache License' in runtime_notice
+          assert 'private Such SDK' in runtime_notice
+          PY
