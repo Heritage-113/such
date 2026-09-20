@@ -16,14 +16,15 @@ manifest = {
 }
 manifest.add('PACKAGE_MANIFEST.txt')
 allowed_roots = {Path(entry).parts[0] for entry in manifest}
-ignored_roots = {'.git', '.cache', '.runtime', 'build', 'dist'}
+
+# Repository/CI metadata and generated/local outputs are not distributable
+# package payload. Keep them outside PACKAGE_MANIFEST instead of forcing the
+# product manifest to know about GitHub Actions implementation details.
+ignored_roots = {'.git', '.github', '.cache', '.runtime', 'build', 'dist'}
 
 bad = []
 missing = []
 
-# The manifest is the authority.  Do not maintain a second hand-written
-# allow-list here: that was the reason the WindowsFix validation document was
-# accidentally rejected by this audit in v1.0.0.
 for child in root.iterdir():
     if child.name in ignored_roots:
         continue
