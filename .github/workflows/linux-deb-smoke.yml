@@ -41,3 +41,5 @@ jobs:
           out="$(SUCH_STATE_DIR=/tmp/such-state /tmp/such-deb-root/opt/such/bin/SuchCLI SuchDebSmoke_47291)"
           printf '%s\n' "$out"
           grep -q 'SuchDebSmoke_47291.txt' <<<"$out"
+      - name: Record validation target
+        run: echo 'audit fix validation'
