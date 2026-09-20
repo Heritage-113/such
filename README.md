@@ -2,68 +2,53 @@
 
 **Such, a great search tool.**
 
-Finding a file should not feel like archaeology.
+Very fast local file search by Heritage Inc.
 
-Such is a native cross-platform file search app built around one idea:
+Desktop support: **Windows x64 and Linux x64**. macOS desktop is not supported.
 
-> Search first. Everything else gets out of the way.
-
-No giant file tree.  
-No dashboard.  
-No Electron.  
-No fifty buttons explaining how powerful the search engine is.
-
-Just type what you remember and get the file.
+## CLI
 
 ```text
-report
-/pdf report
-/pin
-/drive
+such report.pdf          search
+such root                show roots
+such root ~/Work         replace root
+such root + /mnt/archive add root
+such scan                rebuild index
+such status              index status
+such stop                stop Such processes
+such stop --force        force stop
+such version             version
+such help                help
 ```
 
-On macOS, Linux, and iPadOS, command-style filters use `//` instead of `/`.
-
-## What it does
-
-- Native desktop UI
-- Fast local file search
-- Filename and path search
-- Extension and date filters
-- Persistent pins
-- Native file icons
-- Search-root switching with `/drive`
-- Additional roots with `/index`
-- Font selection with `/font`
-- Windows, Linux, macOS, and iPadOS frontend targets
-- Stable runtime ABI for production search
-
-## Philosophy
-
-Such is intentionally boring on screen.
-
-The search field is the interface.  
-Management stays behind commands and gestures.  
-The engine can be complicated. The screen should not be.
+Search needs no command:
 
 ```text
-Fast because it does less.
+such structural drawing
+such /dwg plan
+such /20260901-20260919 invoice
 ```
 
-## Repository layout
+The GUI also supports `/;` detail search and `/claude` / `/codex` agent launch.
 
-This public repository contains the Such frontend, CLI, installer logic, runtime client, and stable public ABI.
+## v1.0
 
-The production search runtime is distributed separately. Its implementation is intentionally not part of this repository.
+The v1.0 package contains the public Such source plus the required prebuilt production runtime artifacts for Windows x64 and Linux x64. No macOS desktop runtime is shipped.
 
-The current SourceOnly package is included as a ZIP in the repository root.
+## Build
 
-## Building
+Linux:
 
-See [`BUILDING.md`](BUILDING.md).
+```bash
+scripts/build_linux.sh --clean
+```
 
-## About
+Windows:
 
-Such is developed by **Heritage Inc.**
+```bat
+scripts\doctor_windows.cmd
+scripts\build_windows.cmd -Clean
+scripts\verify_windows.cmd -Clean
+```
 
-Practical tools. Native code. Fewer buttons.
+**2026 Heritage Inc.**
