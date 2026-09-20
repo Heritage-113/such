@@ -26,3 +26,6 @@ jobs:
       - name: Release clean
         shell: cmd
         run: scripts\release_windows.cmd -Clean
+      - name: Validation marker
+        shell: cmd
+        run: echo windows validation rerun
