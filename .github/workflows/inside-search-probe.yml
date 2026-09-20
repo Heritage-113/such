@@ -1,0 +1,57 @@
+name: inside-search-probe
+
+on:
+  push:
+    branches:
+      - dev/inside-search
+  workflow_dispatch:
+
+jobs:
+  linux-probe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure public build
+        run: >-
+          cmake -S . -B build
+          -DSUCH_BUILD_GUI=OFF
+          -DSUCH_BUILD_CLI=ON
+          -DSUCH_BUILD_TESTS=ON
+          -DSUCH_STRICT_WARNINGS=ON
+
+      - name: Build public targets
+        run: cmake --build build --parallel 2
+
+      - name: Run public tests
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Probe bundled runtime exports
+        shell: bash
+        run: |
+          set -euxo pipefail
+          RUNTIME="$GITHUB_WORKSPACE/.runtime/SuchRuntimePrivate_v0.6.2_Linux_x64_RuntimeOnly/libSuchRuntimePrivate.so"
+          test -f "$RUNTIME"
+          nm -D --defined-only "$RUNTIME" | grep 'such_runtime_' | sort
+
+      - name: Execute inside-search probe
+        shell: bash
+        run: |
+          set -euxo pipefail
+          export SUCH_RUNTIME_LIBRARY="$GITHUB_WORKSPACE/.runtime/SuchRuntimePrivate_v0.6.2_Linux_x64_RuntimeOnly/libSuchRuntimePrivate.so"
+          export XDG_STATE_HOME="$RUNNER_TEMP/xdg-state"
+          export XDG_CONFIG_HOME="$RUNNER_TEMP/xdg-config"
+          export XDG_CACHE_HOME="$RUNNER_TEMP/xdg-cache"
+          FIXTURE="$RUNNER_TEMP/such-inside-fixture"
+          mkdir -p "$FIXTURE"
+          printf 'alpha beta\nforce majeure warranty\n' > "$FIXTURE/contract_notes.txt"
+          printf 'no matching body here\n' > "$FIXTURE/warranty_filename.txt"
+          printf 'renderer overlayMode sentinel\n' > "$FIXTURE/xref_loader.cpp"
+          ./build/SuchCLI root "$FIXTURE"
+          ./build/SuchCLI status
+          echo '--- ordinary search: warranty ---'
+          ./build/SuchCLI warranty || true
+          echo '--- requested syntax: /inside warranty ---'
+          ./build/SuchCLI /inside warranty || true
+          echo '--- requested syntax: /inside renderer ---'
+          ./build/SuchCLI /inside renderer || true
