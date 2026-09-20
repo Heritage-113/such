@@ -3,7 +3,11 @@ BUILD_VALIDATION_v1.0.0.md
 BUILD_VALIDATION_v1.0.0_Windows.md
 CMakeLists.txt
 CODE_REVIEW_v1.0.0.md
+CONTRIBUTING.md
+LICENSE
+NOTICE
 README.md
+SECURITY.md
 apps/such_cli.cpp
 assets/icon/Such.ico
 assets/icon/SuchIcon_1024.png
