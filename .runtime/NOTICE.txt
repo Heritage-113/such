@@ -1,0 +1,10 @@
+Such production runtime notice
+Copyright 2026 Heritage Inc.
+
+The prebuilt production runtime binaries stored under this `.runtime/` directory are separate Heritage Inc. artifacts.
+
+They are NOT licensed under the Apache License, Version 2.0 that applies to the public Such source code.
+
+Possession of these binaries in this repository does not publish the production runtime source code or the private Such SDK and does not grant rights beyond any separate terms provided by Heritage Inc.
+
+For SDK access, embedding, commercial deployment, or runtime licensing questions, contact Heritage Inc. through https://heritage-labs.net.
