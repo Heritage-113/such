@@ -59,8 +59,12 @@ if [[ -f "$INSTALL_DIR/share/icons/hicolor/256x256/apps/such.png" ]]; then
   install -m 0644 "$INSTALL_DIR/share/icons/hicolor/256x256/apps/such.png" \
     "$PACKAGE_ROOT/usr/share/icons/hicolor/256x256/apps/such.png"
 fi
-if [[ -d "$INSTALL_DIR/share/doc/such/runtime" ]]; then
-  cp -a "$INSTALL_DIR/share/doc/such/runtime/." "$PACKAGE_ROOT/usr/share/doc/such/runtime/"
+
+# Copy the complete Such documentation/legal payload from CMake install staging.
+# This includes the public Apache-2.0 LICENSE and NOTICE plus the separate
+# production-runtime notice and any runtime third-party legal files.
+if [[ -d "$INSTALL_DIR/share/doc/such" ]]; then
+  cp -a "$INSTALL_DIR/share/doc/such/." "$PACKAGE_ROOT/usr/share/doc/such/"
 fi
 
 cat > "$PACKAGE_ROOT/DEBIAN/control" <<EOF
