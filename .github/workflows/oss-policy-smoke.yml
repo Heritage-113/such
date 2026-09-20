@@ -1,0 +1,67 @@
+name: OSS policy packaging validation
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/oss-policy-smoke.yml
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake g++ libx11-dev libpng-dev python3 pkg-config dpkg-dev
+      - name: Audit repository policy files
+        run: |
+          python3 scripts/audit_repository_layout.py
+          test -f LICENSE
+          test -f NOTICE
+          test -f CONTRIBUTING.md
+          test -f SECURITY.md
+          test -f CODE_OF_CONDUCT.md
+          test -f .runtime/NOTICE.txt
+      - name: Build Debian package
+        run: ./scripts/build_deb.sh
+      - name: Inspect Debian legal payload
+        run: |
+          set -euo pipefail
+          DEB="dist/artifacts/such_1.0.0_amd64.deb"
+          test -f "$DEB"
+          rm -rf /tmp/such-deb-policy
+          mkdir -p /tmp/such-deb-policy
+          dpkg-deb -x "$DEB" /tmp/such-deb-policy
+          test -f /tmp/such-deb-policy/usr/share/doc/such/LICENSE
+          test -f /tmp/such-deb-policy/usr/share/doc/such/NOTICE
+          test -f /tmp/such-deb-policy/usr/share/doc/such/runtime/HERITAGE_RUNTIME_NOTICE.txt
+          grep -q 'Apache License' /tmp/such-deb-policy/usr/share/doc/such/LICENSE
+          grep -q 'NOT licensed under the Apache License' /tmp/such-deb-policy/usr/share/doc/such/runtime/HERITAGE_RUNTIME_NOTICE.txt
+
+  windows:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build Windows release
+        shell: cmd
+        run: scripts\release_windows.cmd -Clean -Generator "Visual Studio 17 2022"
+      - name: Inspect Windows legal payload
+        shell: pwsh
+        run: |
+          $zip = Join-Path $PWD 'dist\artifacts\Such_v1.0.0_Windows_x64_Public.zip'
+          if (-not (Test-Path -LiteralPath $zip)) { throw "release zip missing: $zip" }
+          $dst = Join-Path $env:RUNNER_TEMP 'such-win-policy'
+          Remove-Item -Recurse -Force $dst -ErrorAction SilentlyContinue
+          Expand-Archive -LiteralPath $zip -DestinationPath $dst
+          $license = Get-ChildItem -Path $dst -Recurse -File -Filter LICENSE | Select-Object -First 1
+          $notice = Get-ChildItem -Path $dst -Recurse -File -Filter NOTICE | Select-Object -First 1
+          $runtimeNotice = Get-ChildItem -Path $dst -Recurse -File -Filter HERITAGE_RUNTIME_NOTICE.txt | Select-Object -First 1
+          if ($null -eq $license) { throw 'LICENSE missing from Windows release' }
+          if ($null -eq $notice) { throw 'NOTICE missing from Windows release' }
+          if ($null -eq $runtimeNotice) { throw 'runtime notice missing from Windows release' }
+          if (-not (Select-String -LiteralPath $license.FullName -Pattern 'Apache License' -Quiet)) { throw 'Apache license text missing' }
