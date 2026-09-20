@@ -1,0 +1,53 @@
+name: Import Such v1.0 release package
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/import-v1.yml
+
+permissions:
+  contents: write
+
+jobs:
+  import-v1:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download V1.0 release package
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/such-v1 /tmp/such-unpack
+          mkdir -p /tmp/such-v1 /tmp/such-unpack
+          gh release download 1.0 --repo "$GITHUB_REPOSITORY" --pattern 'such.v1.0.zip' --dir /tmp/such-v1
+          echo '3ddc81e282d87a01c10a1b9372b95ca812ddd97598e818cf032ad9b00c3b3db0  /tmp/such-v1/such.v1.0.zip' | sha256sum -c -
+          unzip -q /tmp/such-v1/such.v1.0.zip -d /tmp/such-unpack
+
+      - name: Replace repository with V1.0 package contents
+        run: |
+          set -euo pipefail
+          SRC_DIR="$(dirname "$(find /tmp/such-unpack -type f -name PACKAGE_MANIFEST.txt -print -quit)")"
+          test -n "$SRC_DIR"
+          test -f "$SRC_DIR/CMakeLists.txt"
+          test -f "$SRC_DIR/.runtime/windows-x64/SuchRuntimePrivate.dll"
+          test -f "$SRC_DIR/.runtime/SuchRuntimePrivate_v0.6.2_Linux_x64_RuntimeOnly/libSuchRuntimePrivate.so"
+          rsync -a --delete --exclude='.git/' --exclude='.github/' "$SRC_DIR/" "$GITHUB_WORKSPACE/"
+          rm -f "$GITHUB_WORKSPACE/.github/workflows/import-v1.yml"
+
+      - name: Commit V1.0 source and runtime artifacts
+        run: |
+          set -euo pipefail
+          git config user.name 'Heritage Inc.'
+          git config user.email 'jimin@heritage-labs.net'
+          git add -A
+          if git diff --cached --quiet; then
+            echo 'No changes to commit.'
+            exit 0
+          fi
+          git commit -m 'Release Such v1.0'
+          git push origin HEAD:main
