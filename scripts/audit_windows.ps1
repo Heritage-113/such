@@ -93,14 +93,19 @@ if ($win -notmatch '#include\s+<such/Version\.h>') {
   Fail-Audit 'Win32 product title/version must come from generated such/Version.h.'
 }
 
-# Public-boundary checks are repeated here rather than delegated to Python so a
-# clean Visual Studio/CMake machine can build the archive without Python.
+# Source-boundary checks apply only to source-owned material. VCS metadata,
+# injected production runtimes, CI metadata, and build outputs are intentionally
+# outside this audit's responsibility.
+$ignoredRoots = @('.git', '.github', '.runtime', 'build', 'dist')
 $forbiddenNames = @('third_party', 'topodb', 'search.topodb')
 foreach ($entry in Get-ChildItem -LiteralPath $SourceRoot -Recurse -Force) {
-  $relative = $entry.FullName.Substring($SourceRoot.Length).TrimStart([char[]]'\/')
+  $relative = $entry.FullName.Substring($SourceRoot.Length).TrimStart([char[]]'\\/')
+  if ([string]::IsNullOrWhiteSpace($relative)) { continue }
+  $firstPart = ($relative -split '[\\/]', 2)[0]
+  if ($ignoredRoots -contains $firstPart) { continue }
   foreach ($name in $forbiddenNames) {
     if ($relative.IndexOf($name, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
-      Fail-Audit "private-backend material leaked into public tree: $relative"
+      Fail-Audit "private-backend material leaked into public source tree: $relative"
     }
   }
   if (($entry.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
