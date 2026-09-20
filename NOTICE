@@ -1,0 +1,12 @@
+Such
+Copyright 2026 Heritage Inc.
+
+The public Such source code, documentation, and public build tooling in this repository are licensed under the Apache License, Version 2.0, except where a file or directory is explicitly identified as being under separate terms.
+
+The production runtime binaries distributed under `.runtime/` are NOT licensed under the Apache License, Version 2.0. They are separate Heritage Inc. runtime artifacts and are available only under separate terms provided by Heritage Inc.
+
+The Such SDK is not distributed as part of this public repository and is not granted under the Apache License, Version 2.0 by publication of this repository. SDK access and commercial embedding/integration terms are available separately from Heritage Inc.
+
+The names "Such", "Heritage", and "Heritage Inc.", associated logos, and other branding are not licensed as trademarks under the Apache License. Apache-2.0 Section 6 applies.
+
+Third-party components, if any, remain subject to their respective licenses and notices.
