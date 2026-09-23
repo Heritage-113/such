@@ -5,7 +5,7 @@ on:
     branches:
       - automation/v1.1.4-public-refresh
     paths:
-      - '.github/source-bundle-*.b64'
+      - '.github/source-bundle-ready'
 
 permissions:
   contents: write
@@ -18,15 +18,20 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Apply source payload
+      - name: Apply v1.1.6 source payload
         shell: bash
         run: |
           set -euo pipefail
           cat .github/source-bundle-*.b64 | base64 -d > /tmp/such-v1.1.6.tar.xz
-          echo 'cf41157da7ccb2f94fd25d3f7ba38a542c435e0c31782feb133929e9d139fb10  /tmp/unused.tar.gz' >/dev/null
-          rm -rf apps assets cmake docs font-bundles include platform runtime scripts src tests
-          rm -f BUILD_VALIDATION_v*.md CODE_REVIEW_v*.md PACKAGE_MANIFEST.txt README.md CMakeLists.txt
+          xz -t /tmp/such-v1.1.6.tar.xz
           tar -xJf /tmp/such-v1.1.6.tar.xz -C .
+
+          rm -f \
+            BUILD_VALIDATION_v1.0.0.md \
+            BUILD_VALIDATION_v1.0.0_Windows.md \
+            CODE_REVIEW_v1.0.0.md \
+            docs/DEVELOPMENT_HANDOFF_v1.0.0.md \
+            runtime/RUNTIME_SHA256_v1.0.0.txt
 
           mkdir -p .runtime/linux-x64/licenses
           cp .runtime/SuchRuntimePrivate_v0.6.2_Linux_x64_RuntimeOnly/libSuchRuntimePrivate.so .runtime/linux-x64/libSuchRuntimePrivate.so
@@ -36,24 +41,33 @@ jobs:
           rm -rf .runtime/SuchRuntimePrivate_v0.6.2_Linux_x64_RuntimeOnly
 
           rm -f .github/source-bundle-*.b64
+          rm -f .github/source-bundle-ready
           rm -f .github/workflows/apply-v114-source.yml
 
-      - name: Verify source and Linux build
+      - name: Verify public tree
         shell: bash
         run: |
           set -euo pipefail
           python3 scripts/audit_repository_layout.py
+
+      - name: Verify hermetic Linux build
+        shell: bash
+        run: |
+          set -euo pipefail
           env -i \
             HOME=/tmp/such-host-home \
             PATH=/definitely/not/a/real/path \
+            CC=/bin/false \
             CXX=/bin/false \
             CONFIG=Debug \
             BUILD_DIR=/tmp/redirected-build \
             INSTALL_DIR=/tmp/redirected-install \
+            JOBS=1 \
             RUNTIME_LIBRARY_PATH=/tmp/not-the-runtime.so \
+            CMAKE_TOOLCHAIN_FILE=/tmp/not-a-toolchain.cmake \
             /bin/bash -p scripts/build_linux.sh --clean --require-runtime
 
-      - name: Publish one clean v1.1.6 commit on staging branch
+      - name: Publish clean v1.1.6 staging commit
         shell: bash
         run: |
           set -euo pipefail
@@ -62,5 +76,5 @@ jobs:
           git add -A
           tree_sha="$(git write-tree)"
           parent_sha="$(git rev-parse origin/main)"
-          commit_sha="$(printf '%s\n\n%s\n' 'Release Such v1.1.6' 'Refresh the public source, keep Such non-resident, seal Linux build inputs, and use the native Windows cue banner.' | git commit-tree "$tree_sha" -p "$parent_sha")"
+          commit_sha="$(printf '%s\n\n%s\n' 'Release Such v1.1.6' 'Refresh public Such, preserve non-resident startup, seal Linux build inputs, and use the native Windows search cue banner.' | git commit-tree "$tree_sha" -p "$parent_sha")"
           git push --force origin "$commit_sha:refs/heads/automation/v1.1.4-public-refresh"
