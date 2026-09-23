@@ -1,5 +1,6 @@
 #include <such/Version.h>
 #include <such/runtime/RuntimeClient.h>
+#include <such/security/SecureSearchGate.h>
 #include <such/ui/DesignContract.h>
 #include <such/ui/AgentLauncher.h>
 #include <such/ui/IndexCommands.h>
@@ -40,13 +41,16 @@ namespace {
 using such::ui::ResultAction;
 using such::ui::SwipeSide;
 
-constexpr wchar_t kClassName[] = L"HeritageSuchV100Window";
+constexpr wchar_t kClassName[] = L"HeritageSuchV110Window";
 constexpr wchar_t kSearchClass[] = L"EDIT";
 constexpr UINT kMsgAutocomplete = WM_APP + 1;
 constexpr UINT kMsgCloseTransient = WM_APP + 2;
 constexpr UINT kMsgOpenSelected = WM_APP + 3;
 constexpr UINT kMsgEnsureIndexRoot = WM_APP + 4;
 constexpr UINT_PTR kTimerRuntimeRefresh = 3;
+
+constexpr float kSearchLeftContentInsetDip = 39.0f;
+constexpr float kSearchRightContentInsetDip = 44.0f;
 
 constexpr COLORREF kPaper = RGB(243, 239, 229);       // #F3EFE5
 constexpr COLORREF kBright = RGB(251, 248, 239);      // #FBF8EF
@@ -92,6 +96,7 @@ std::wstring gQuery;
 std::vector<such::ui::ResultItem> gResults;
 std::string gSearchError;
 std::unique_ptr<such::runtime::RuntimeClient> gRuntime;
+such::security::SecureSearchGate gSecurityGate;
 std::uint64_t gRuntimeGeneration = 0;
 std::size_t gRuntimeIndexedFiles = 0;
 bool gRuntimeIndexing = false;
@@ -1150,7 +1155,7 @@ void draw_detail_tree(HDC dc, const such::ui::WindowLayout& layout, float scale)
     const auto& m = layout.metrics;
     const float branch_h = std::clamp(m.row_height * 0.50f, 28.0f, 36.0f);
     const float branch_gap = std::clamp(m.row_gap * 0.75f, 4.0f, 7.0f);
-    const float base_y = m.top_padding + m.search_height + m.search_to_results_gap;
+    const float base_y = layout.security.y + layout.security.height + m.security_to_results_gap;
     HGDIOBJ oldFont = SelectObject(dc, gPathFont);
     SetBkMode(dc, TRANSPARENT);
     for (std::size_t i = 0; i < detail.refinements.size(); ++i) {
@@ -1178,6 +1183,92 @@ void draw_detail_tree(HDC dc, const such::ui::WindowLayout& layout, float scale)
     SelectObject(dc, oldFont);
 }
 
+
+void draw_security_toggle(HDC dc, const such::ui::WindowLayout& layout, float scale) {
+    const RECT row = to_rect(layout.security, scale);
+    HGDIOBJ oldFont = SelectObject(dc, gPathFont ? gPathFont : GetStockObject(DEFAULT_GUI_FONT));
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, kDarkGreen);
+
+    RECT label = row;
+    label.left += px(2.0f, scale);
+    label.right = label.left + px(64.0f, scale);
+    DrawTextW(dc, L"Security", -1, &label,
+              DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+
+    const int switchW = px(34.0f, scale);
+    const int switchH = px(18.0f, scale);
+    const int switchX = row.left + px(72.0f, scale);
+    const int switchY = (row.top + row.bottom - switchH) / 2;
+    RECT sw{switchX, switchY, switchX + switchW, switchY + switchH};
+    fill_round(dc, sw, switchH / 2, gSecurityGate.active() ? kDarkGreen : kHairline);
+
+    const int knob = std::max(px(10.0f, scale), switchH - px(4.0f, scale));
+    const int knobX = gSecurityGate.active()
+        ? sw.right - knob - px(2.0f, scale)
+        : sw.left + px(2.0f, scale);
+    const int knobY = sw.top + (switchH - knob) / 2;
+    RECT k{knobX, knobY, knobX + knob, knobY + knob};
+    fill_round(dc, k, knob / 2, kBright);
+
+    SelectObject(dc, oldFont);
+}
+
+bool hit_security_toggle(HWND hwnd, int x, int y) {
+    RECT client{};
+    GetClientRect(hwnd, &client);
+    const float scale = scale_for_window(hwnd);
+    const auto layout = window_layout_for_query(
+        static_cast<float>(client.right) / scale,
+        static_cast<float>(client.bottom) / scale);
+    const RECT row = to_rect(layout.security, scale);
+    return point_in_rect(row, x, y);
+}
+
+void show_enterprise_security_notice(HWND hwnd) {
+    const wchar_t* message =
+        L"보안검색은 본사와 연락이 필요합니다.\n\n"
+        L"Enterprise Such needs connection to corporation\n\n"
+        L"https://such.heritage-labs.net\n\n"
+        L"Open the Enterprise Such website?";
+    const int answer = MessageBoxW(
+        hwnd, message, L"Such Enterprise Security",
+        MB_OKCANCEL | MB_ICONINFORMATION | MB_DEFBUTTON1);
+    if (answer == IDOK) {
+        (void)ShellExecuteW(
+            hwnd, L"open", L"https://such.heritage-labs.net",
+            nullptr, nullptr, SW_SHOWNORMAL);
+    }
+}
+
+void request_security_toggle(HWND hwnd) {
+    if (gSecurityGate.active()) {
+        (void)gSecurityGate.request_disable();
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return;
+    }
+
+    std::string error;
+    const auto decision = gSecurityGate.request_enable(error);
+    switch (decision) {
+        case such::security::SecureSearchDecision::Activated:
+            break;
+        case such::security::SecureSearchDecision::RequiresEnterpriseActivation:
+            show_enterprise_security_notice(hwnd);
+            break;
+        case such::security::SecureSearchDecision::Denied:
+            MessageBoxW(
+                hwnd,
+                widen_utf8(error.empty() ? "Secure Search activation was denied" : error).c_str(),
+                L"Such Enterprise Security",
+                MB_OK | MB_ICONWARNING);
+            break;
+        case such::security::SecureSearchDecision::Deactivated:
+            break;
+    }
+    InvalidateRect(hwnd, nullptr, FALSE);
+}
+
 void paint(HWND hwnd) {
     PAINTSTRUCT ps{};
     HDC windowDc = BeginPaint(hwnd, &ps);
@@ -1203,11 +1294,10 @@ void paint(HWND hwnd) {
     DeleteObject(bg);
     SetBkMode(dc, TRANSPARENT);
 
-    // Keep the command/search surface stable while the runtime is working.
-    // Indexing state is communicated by status text, not by recoloring the bar.
     RECT search = to_rect(layout.search, scale);
     fill_round(dc, search, px(m.search_radius, scale), kBright);
-    stroke_round(dc, search, px(m.search_radius, scale), kDarkGreen, std::max(1, px(1.0f, scale)));
+    stroke_round(dc, search, px(m.search_radius, scale), kDarkGreen,
+                 std::max(1, px(1.0f, scale)));
     RECT inner = search;
     InflateRect(&inner, -1, -1);
     HPEN hi = CreatePen(PS_SOLID, 1, kHighlight);
@@ -1228,6 +1318,7 @@ void paint(HWND hwnd) {
         draw_clear_button(dc, clear, point_in_rect(clear, cursor.x, cursor.y));
     }
 
+    draw_security_toggle(dc, layout, scale);
     draw_detail_tree(dc, layout, scale);
 
     const RECT viewportPx = to_rect(layout.results_viewport, scale);
@@ -1286,8 +1377,8 @@ void layout_children(HWND hwnd) {
         static_cast<float>(client.bottom) / scale);
     ensure_fonts(hwnd, layout.metrics);
     RECT s = to_rect(layout.search, scale);
-    const int leftInset = px(39.0f, scale);
-    const int rightInset = px(44.0f, scale);
+    const int leftInset = px(kSearchLeftContentInsetDip, scale);
+    const int rightInset = px(kSearchRightContentInsetDip, scale);
     const int verticalInset = px(5.0f, scale);
     const int searchX = static_cast<int>(s.left) + leftInset;
     const int searchY = static_cast<int>(s.top) + verticalInset;
@@ -1296,6 +1387,9 @@ void layout_children(HWND hwnd) {
     const int searchH = std::max(
         1, static_cast<int>(s.bottom - s.top) - verticalInset * 2);
     MoveWindow(gSearch, searchX, searchY, searchW, searchH, TRUE);
+    SendMessageW(gSearch, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN,
+                 MAKELPARAM(px(1.0f, scale), px(1.0f, scale)));
+    SetWindowRgn(gSearch, nullptr, TRUE);
     update_scrollbar(hwnd);
 }
 
@@ -1332,24 +1426,6 @@ void move_selection(HWND hwnd, int delta) {
 
 LRESULT CALLBACK search_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     HWND parent = GetParent(hwnd);
-    if (msg == WM_PAINT) {
-        const LRESULT result = CallWindowProcW(gOldSearchProc, hwnd, msg, wp, lp);
-        if (GetWindowTextLengthW(hwnd) == 0) {
-            HDC dc = GetDC(hwnd);
-            if (dc) {
-                RECT rc{};
-                GetClientRect(hwnd, &rc);
-                rc.left += 1;
-                SetBkMode(dc, TRANSPARENT);
-                SetTextColor(dc, gRuntimeIndexing ? kBright : kPlaceholderGray);
-                HGDIOBJ oldFont = SelectObject(dc, gSearchFont ? gSearchFont : GetStockObject(DEFAULT_GUI_FONT));
-                DrawTextW(dc, L"2026 Heritage Inc.", -1, &rc, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-                SelectObject(dc, oldFont);
-                ReleaseDC(hwnd, dc);
-            }
-        }
-        return result;
-    }
     if (msg == WM_MOUSEWHEEL) {
         return SendMessageW(parent, WM_MOUSEWHEEL, wp, lp);
     }
@@ -1371,8 +1447,8 @@ LRESULT CALLBACK search_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 return 0;
             case VK_RETURN:
                 if (execute_agent_command(parent) || execute_font_command(parent) || execute_index_command(parent)) return 0;
-                if (gRuntime && !runtime_has_roots() && !gQuery.empty()) {
-                    SendMessageW(parent, kMsgEnsureIndexRoot, 1, 0);
+                if (gRuntime && !runtime_has_roots()) {
+                    SendMessageW(parent, kMsgEnsureIndexRoot, gQuery.empty() ? 0 : 1, 0);
                     return 0;
                 }
                 SendMessageW(parent, kMsgOpenSelected, 0, 0);
@@ -1391,6 +1467,9 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                                       0, 0, 10, 10, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kSearchId)),
                                       reinterpret_cast<LPCREATESTRUCTW>(lp)->hInstance, nullptr);
             if (!gSearch) return -1;
+            const std::wstring searchPlaceholder = widen_utf8(such::ui::design::kSearchPlaceholder);
+            SendMessageW(gSearch, EM_SETCUEBANNER, TRUE,
+                         reinterpret_cast<LPARAM>(searchPlaceholder.c_str()));
             gOldSearchProc = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(gSearch, GWLP_WNDPROC,
                                                                          reinterpret_cast<LONG_PTR>(search_proc)));
             layout_children(hwnd);
@@ -1514,25 +1593,31 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         case WM_LBUTTONDOWN: {
             if (GetTickCount64() < gIgnoreMouseUntil) return 0;
-            SetFocus(gSearch);
             const int x = GET_X_LPARAM(lp);
             const int y = GET_Y_LPARAM(lp);
-            if (const int fontRow = hit_font_row(hwnd, x, y); fontRow >= 0) {
-                gFontPickerSelection = fontRow;
-                (void)apply_font_picker_selection(hwnd);
-                SetFocus(gSearch);
+            if (hit_security_toggle(hwnd, x, y)) {
+                request_security_toggle(hwnd);
                 return 0;
             }
-            RECT client{}; GetClientRect(hwnd, &client);
+            SetFocus(gSearch);
+            RECT client{};
+            GetClientRect(hwnd, &client);
             const float uiScale = scale_for_window(hwnd);
             const auto clickLayout = window_layout_for_query(
-                static_cast<float>(client.right) / uiScale, static_cast<float>(client.bottom) / uiScale);
+                static_cast<float>(client.right) / uiScale,
+                static_cast<float>(client.bottom) / uiScale);
             const RECT search = to_rect(clickLayout.search, uiScale);
             const RECT clear = search_clear_rect(search, uiScale);
             if (!gQuery.empty() && point_in_rect(clear, x, y)) {
                 SetWindowTextW(gSearch, L"");
                 SendMessageW(gSearch, EM_SETSEL, 0, 0);
                 refresh_query(hwnd);
+                return 0;
+            }
+            if (const int fontRow = hit_font_row(hwnd, x, y); fontRow >= 0) {
+                gFontPickerSelection = fontRow;
+                (void)apply_font_picker_selection(hwnd);
+                SetFocus(gSearch);
                 return 0;
             }
             int actionRow = -1;
@@ -1588,6 +1673,10 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (!pointer_client_point(hwnd, wp, client, pointerId)) return 0;
             if (gActivePointerId != 0 && gActivePointerId != pointerId) return 0;
             gIgnoreMouseUntil = GetTickCount64() + 350;
+            if (hit_security_toggle(hwnd, client.x, client.y)) {
+                request_security_toggle(hwnd);
+                return 0;
+            }
             int actionRow = -1; ResultAction action{};
             if (hit_swipe_action(hwnd, client.x, client.y, actionRow, action)) {
                 POINT screen = client; ClientToScreen(hwnd, &screen);
@@ -1760,20 +1849,22 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     }
     if (gSmokeHold) gSmoke = false;
 
-    auto lease = such::ui::FrontendLease::try_acquire(such::ui::FrontendMode::Gui);
-    if (!lease.acquired()) {
-        if (!gSmoke) {
+    such::ui::FrontendLease lease;
+    if (!gSmoke) {
+        lease = such::ui::FrontendLease::try_acquire(such::ui::FrontendMode::Gui);
+        if (!lease.acquired()) {
             MessageBoxW(nullptr,
                         L"Another Such window is already open.",
                         L"Such", MB_OK | MB_ICONINFORMATION);
+            return 23;
         }
-        return 23;
     }
 
     if (leaseHoldMs > 0) {
         Sleep(static_cast<DWORD>(leaseHoldMs));
         return 0;
     }
+
 
     if (!gDemo) {
         gRuntime = std::make_unique<such::runtime::RuntimeClient>();
@@ -1818,22 +1909,23 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
                                 CW_USEDEFAULT, CW_USEDEFAULT, 760, 600,
                                 nullptr, nullptr, instance, nullptr);
     if (!hwnd) return 3;
-    ShowWindow(hwnd, show);
+    // This is an interactive desktop application. Some launch paths can pass
+    // SW_HIDE even though the user explicitly started Such; recover to a
+    // normal visible window instead of leaving only a background process.
+    ShowWindow(hwnd, show == SW_HIDE ? SW_SHOWNORMAL : show);
     UpdateWindow(hwnd);
+    SetForegroundWindow(hwnd);
     if (gRuntime) {
         SetTimer(hwnd, kTimerRuntimeRefresh, 250, nullptr);
-        // A fresh installation previously had no searchable roots and therefore
-        // looked broken until the hidden /index command was discovered. Keep
-        // the main UI chrome-free, but ask once through the native folder
-        // picker so the application has an actual search corpus immediately.
+        // Keep first launch non-modal. The empty-state prompt explains that
+        // Enter opens the folder picker; opening it here can strand the picker
+        // behind another window and make Such look like a background process.
         if (!gSmoke && !gSmokeHold && !gDemo) {
             std::string rootsError;
             const auto roots = gRuntime->roots(&rootsError);
             if (!rootsError.empty()) {
                 gSearchError = "Could not list search roots: " + rootsError;
                 MessageBoxW(hwnd, widen_utf8(gSearchError).c_str(), L"Such - Search roots unavailable", MB_OK | MB_ICONWARNING);
-            } else if (roots.empty()) {
-                PostMessageW(hwnd, kMsgEnsureIndexRoot, 0, 0);
             }
         }
     }

@@ -10,6 +10,14 @@ param(
 )
 $ErrorActionPreference='Stop'
 Set-StrictMode -Version Latest
+
+trap {
+  Write-Host ''
+  Write-Host ('[SUCH:FATAL] ' + $_.Exception.Message) -ForegroundColor Red
+  if ($_.InvocationInfo -and $_.InvocationInfo.PositionMessage) { Write-Host $_.InvocationInfo.PositionMessage -ForegroundColor DarkRed }
+  if (-not [string]::IsNullOrWhiteSpace($_.ScriptStackTrace)) { Write-Host $_.ScriptStackTrace -ForegroundColor DarkRed }
+  exit 1
+}
 $PreflightRoot=[System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 & (Join-Path $PSScriptRoot 'audit_windows.ps1') -SourceRoot $PreflightRoot
 . (Join-Path $PSScriptRoot 'windows_paths.ps1')
@@ -21,8 +29,21 @@ function Invoke-SuchNative {
     [Parameter(Mandatory=$true)][string]$Step
   )
   Write-Host ("[RUN] {0} {1}" -f $FilePath, ($Arguments -join ' '))
-  & $FilePath @Arguments
-  $exitCode=$LASTEXITCODE
+  $startInfo=[System.Diagnostics.ProcessStartInfo]::new()
+  $startInfo.FileName=$FilePath
+  $startInfo.UseShellExecute=$false
+  foreach($argument in $Arguments){[void]$startInfo.ArgumentList.Add($argument)}
+  $pathValue=$env:PATH
+  $startInfo.Environment.Clear()
+  foreach($item in Get-ChildItem Env:){
+    if($item.Name -ieq 'PATH'){continue}
+    $startInfo.Environment[$item.Name]=$item.Value
+  }
+  $startInfo.Environment['Path']=$pathValue
+  $startInfo.Environment['MSBUILDDISABLENODEREUSE']='1'
+  $process=[System.Diagnostics.Process]::Start($startInfo)
+  $process.WaitForExit()
+  $exitCode=$process.ExitCode
   if ($exitCode -ne 0) { throw "$Step failed with exit $exitCode" }
 }
 
@@ -72,7 +93,7 @@ $runtime=Resolve-SuchWindowsRuntime -SourceRoot $Root -ExplicitPath $RuntimeLibr
 if ($null -ne $runtime) {
   Assert-SuchWindowsRuntimeArchitecture -RuntimePath $runtime -Arch $Arch
   if ($RequireRuntime.IsPresent) {
-    if ($Arch -ne 'x64') { throw 'Such v1.0.0 release runtime is available for Windows x64 only.' }
+    if ($Arch -ne 'x64') { throw 'Such v1.1.7 release runtime is available for Windows x64 only.' }
     Assert-SuchWindowsRuntimeSha256 -SourceRoot $Root -RuntimePath $runtime
   }
   $buildBin=Join-Path $Ws.BuildDir $Config
@@ -85,5 +106,6 @@ if ($null -ne $runtime) {
   if ($RequireRuntime.IsPresent) { throw 'Required Windows production runtime is missing. Expected .runtime\windows-x64\SuchRuntimePrivate.dll or -RuntimeLibraryPath.' }
   Write-Host 'Production runtime: not present (frontend-only build).'
 }
+
 
 Write-Host "Public Windows build complete: $($Ws.BuildDir)"

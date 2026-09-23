@@ -435,7 +435,7 @@ Such는 파일 아이콘을 직접 디자인하지 않는다.
 
 ### macOS (unsupported)
 
-Desktop macOS support is intentionally excluded from Such v1.0.0 and later maintenance. No macOS build, bundle, runtime, or release path is maintained.
+Desktop macOS support is intentionally excluded from Such v1.1.7 and later maintenance. No macOS build, bundle, runtime, or release path is maintained.
 
 ### Linux
 
@@ -630,7 +630,7 @@ Explorer에서 **정확한 파일을 선택한 상태**로 reveal하는 것을 �
 
 ### macOS (unsupported)
 
-Desktop macOS support is intentionally excluded from Such v1.0.0 and later maintenance. No macOS build, bundle, runtime, or release path is maintained.
+Desktop macOS support is intentionally excluded from Such v1.1.7 and later maintenance. No macOS build, bundle, runtime, or release path is maintained.
 
 ### Linux
 

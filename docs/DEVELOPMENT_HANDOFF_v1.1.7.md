@@ -1,4 +1,4 @@
-# Such v1.0.0 Public Handoff
+# Such v1.1.7 Public Handoff
 
 ## Repository role
 
@@ -30,3 +30,12 @@ Do not reintroduce a macOS desktop build/runtime path by default.
 ## Publication rule
 
 Publish this tree itself. Never create the public repository by copying the private runtime tree and relying on ignore rules.
+
+## v1.1 Secure Search
+
+- Single search field remains the sole top input surface.
+- `Security` toggle sits directly below it.
+- No Enterprise activation => fail-closed notice directing users to https://such.heritage-labs.net.
+- Heritage Secure Core is temporarily removed from this build; the Security toggle remains fail-closed and shows the Enterprise contact notice only.
+- SuchRuntimePrivate v0.7.0 remains the `/inside` content-search runtime.
+- Windows install root is `C:\Heritage\Such`; no self-exclusion rule is used. `%APPDATA%` and `%LOCALAPPDATA%` are opt-in aliases in the Windows search field, while automatic AppData indexing remains blocked.

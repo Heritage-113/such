@@ -9,15 +9,16 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
-if ([string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
-  throw 'LOCALAPPDATA is required for per-user font installation.'
+$localData = [System.Environment]::GetFolderPath([System.Environment+SpecialFolder]::LocalApplicationData)
+if ([string]::IsNullOrWhiteSpace($localData)) {
+  throw 'Windows LocalApplicationData known folder could not be resolved for per-user font installation.'
 }
-
-$fontDir = Join-Path $env:LOCALAPPDATA 'Microsoft\Windows\Fonts'
+$fontDir = Join-Path ([System.IO.Path]::GetFullPath($localData)) 'Microsoft\Windows\Fonts'
 $fontReg = 'HKCU:\Software\Microsoft\Windows NT\CurrentVersion\Fonts'
 New-Item -ItemType Directory -Force -Path $fontDir | Out-Null
 New-Item -Path $fontReg -Force | Out-Null
 
+if (-not ('SuchFontNative' -as [type])) {
 Add-Type -TypeDefinition @'
 using System;
 using System.Runtime.InteropServices;
@@ -28,8 +29,9 @@ public static class SuchFontNative {
     public static extern IntPtr SendMessageTimeoutW(IntPtr hWnd, uint Msg, UIntPtr wParam, IntPtr lParam, uint flags, uint timeout, out UIntPtr result);
 }
 '@
+}
 
-$FR_PRIVATE_NONE = 0u
+$FR_PRIVATE_NONE = [uint32]0
 $HWND_BROADCAST = [IntPtr]0xffff
 $WM_FONTCHANGE = 0x001D
 $SMTO_ABORTIFHUNG = 0x0002
@@ -199,7 +201,7 @@ try {
   $manifest = [ordered]@{
     schemaVersion = 1
     product       = 'Such'
-    version       = '1.0.0'
+    version       = '1.1.7'
     installedAt   = (Get-Date).ToString('o')
     entries       = @($entries)
   }
@@ -209,7 +211,7 @@ try {
   [void][SuchFontNative]::SendMessageTimeoutW($HWND_BROADCAST, $WM_FONTCHANGE, [UIntPtr]::Zero, [IntPtr]::Zero, $SMTO_ABORTIFHUNG, 1000, [ref]$broadcastResult)
 
   Write-Host "Font installation complete: new=$installed reused=$reused skipped=$skipped manifest=$manifestFull"
-  exit 0
+  return
 } finally {
   Remove-Item -LiteralPath $scratch -Recurse -Force -ErrorAction SilentlyContinue
 }

@@ -41,6 +41,10 @@ int main(int argc, char** argv) {
     }
     const auto rows = runtime.search("report", such::ui::PlatformDialect::UnixLike, 25);
     if (rows.size() != 1 || rows.front().filename != "project_report.pdf") return 3;
+    const auto inside = runtime.search("/inside warranty", such::ui::PlatformDialect::UnixLike, 25, &error);
+    if (!error.empty() || inside.size() != 1 || !inside.front().content_match || inside.front().line_number != 42 || inside.front().snippet.empty()) return 19;
+    const auto drilled = runtime.search("project /; /inside warranty", such::ui::PlatformDialect::UnixLike, 25, &error);
+    if (!error.empty() || drilled.size() != 1 || drilled.front().file_id != 7 || !drilled.front().content_match) return 20;
     const auto status = runtime.status();
     if (status.indexed_files != 1 || runtime.observed_extensions().empty()) return 4;
     const auto stats = runtime.engine_stats();

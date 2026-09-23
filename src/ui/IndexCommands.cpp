@@ -33,6 +33,10 @@ std::optional<std::string> cleaned_argument(std::string argument) {
 
 IndexCommand parse_index_command(std::string_view query, PlatformDialect dialect) {
     const std::string value = trim_lower(query);
+    if (dialect == PlatformDialect::Windows &&
+        (value == "%appdata%" || value == "%localappdata%")) {
+        return {IndexCommandKind::AddRoot, true, value};
+    }
     const std::string prefix(operator_prefix(dialect));
     const std::string index_token = prefix + "index";
     if (value == index_token) return {IndexCommandKind::AddRoot, true, std::nullopt};

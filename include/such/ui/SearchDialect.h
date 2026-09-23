@@ -13,6 +13,11 @@ enum class PlatformDialect : std::uint8_t {
     UnixLike,
 };
 
+enum class SearchScope : std::uint8_t {
+    File,
+    Content,
+};
+
 struct DateRange {
     std::optional<std::int64_t> after_unix_seconds;
     std::optional<std::int64_t> before_unix_seconds;
@@ -22,10 +27,13 @@ struct SearchFilter {
     std::string text;
     std::vector<std::string> extensions;
     // Plain-text refinements introduced by /;. Each entry is applied as an
-    // additional conjunctive filename/path filter after runtime ranking.
+    // additional conjunctive filename/path filter after runtime ranking for
+    // legacy file-only searches. RuntimeClient builds a staged plan when the
+    // final refinement enters Content scope.
     std::vector<std::string> detail_terms;
     DateRange modified;
     bool pinned_only = false;
+    SearchScope scope = SearchScope::File;
 };
 
 struct DetailSearch {
@@ -43,11 +51,9 @@ struct Suggestion {
     return dialect == PlatformDialect::Windows ? "/" : "//";
 }
 
-// Parses the platform query dialect. The 3-argument overload recognizes a
-// conservative built-in file-extension set. Runtime integrations should use the
-// 4-argument overload so slash tokens are treated as extension filters only when
-// the extension is actually observed/registered; unknown slash tokens fall back
-// to ordinary text as required by the Such query contract.
+// /inside is a universal single-slash scope operator on every platform. Linux
+// and other Unix-like frontends retain // for filesystem/index operators so
+// absolute paths remain unambiguous.
 [[nodiscard]] SearchFilter parse_search_query(
     std::string_view query,
     PlatformDialect dialect,
@@ -66,9 +72,8 @@ struct Suggestion {
     PlatformDialect dialect,
     const std::vector<std::string>& observed_extensions);
 
-// Rebuilds a query using the stable runtime dialect. This lets the public
-// frontend accept richer syntax (for example compact numeric date ranges)
-// without requiring a private-runtime ABI change.
+// Scope itself is not serialized into the file-search dialect. RuntimeClient
+// dispatches Content scope through the optional content ABI.
 [[nodiscard]] std::string compile_runtime_query(
     const SearchFilter& filter,
     PlatformDialect dialect);

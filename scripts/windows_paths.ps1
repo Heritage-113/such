@@ -1,5 +1,166 @@
 Set-StrictMode -Version Latest
 
+function Get-SuchWindowsKnownFolder {
+    param(
+        [Parameter(Mandatory=$true)]
+        [ValidateSet('UserProfile','LocalApplicationData','ApplicationData','ProgramFiles','CommonApplicationData','Programs','CommonPrograms','Desktop','CommonDesktopDirectory')]
+        [string]$Name
+    )
+
+    try {
+        $specialFolder = switch ($Name) {
+            'UserProfile'          { [System.Environment+SpecialFolder]::UserProfile }
+            'LocalApplicationData' { [System.Environment+SpecialFolder]::LocalApplicationData }
+            'ApplicationData'      { [System.Environment+SpecialFolder]::ApplicationData }
+            'ProgramFiles'         { [System.Environment+SpecialFolder]::ProgramFiles }
+            'CommonApplicationData'{ [System.Environment+SpecialFolder]::CommonApplicationData }
+            'Programs'             { [System.Environment+SpecialFolder]::Programs }
+            'CommonPrograms'       { [System.Environment+SpecialFolder]::CommonPrograms }
+            'Desktop'              { [System.Environment+SpecialFolder]::Desktop }
+            'CommonDesktopDirectory' { [System.Environment+SpecialFolder]::CommonDesktopDirectory }
+            default                { throw "Unsupported Windows known folder: $Name" }
+        }
+        $folder = [System.Environment]::GetFolderPath($specialFolder)
+    } catch {
+        throw ("Windows known-folder resolution failed for {0}: {1}" -f $Name, $_.Exception.Message)
+    }
+    if ([string]::IsNullOrWhiteSpace($folder)) {
+        throw "Windows known-folder resolution returned an empty path for $Name"
+    }
+    return [System.IO.Path]::GetFullPath($folder)
+}
+
+function Get-SuchWindowsInstallRoot {
+    return [System.IO.Path]::GetFullPath('C:\Heritage\Such')
+}
+
+function Send-SuchWindowsEnvironmentChanged {
+    if (-not ('SuchEnvironmentNative' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class SuchEnvironmentNative {
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    public static extern IntPtr SendMessageTimeout(
+        IntPtr hWnd, uint Msg, UIntPtr wParam, string lParam,
+        uint flags, uint timeout, out UIntPtr result);
+}
+'@
+    }
+    $result = [UIntPtr]::Zero
+    [void][SuchEnvironmentNative]::SendMessageTimeout(
+        [IntPtr]0xffff, 0x001A, [UIntPtr]::Zero, 'Environment',
+        0x0002, 5000, [ref]$result)
+}
+
+function Add-SuchWindowsCommandPath {
+    param([Parameter(Mandatory=$true)][string]$Directory)
+    $full = [System.IO.Path]::GetFullPath($Directory).TrimEnd([char[]]'\/')
+    $machinePath = [System.Environment]::GetEnvironmentVariable('Path', 'Machine')
+    $parts = @($machinePath -split ';' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    if (-not ($parts | Where-Object { $_.TrimEnd([char[]]'\/').Equals($full, [System.StringComparison]::OrdinalIgnoreCase) })) {
+        [System.Environment]::SetEnvironmentVariable('Path', (($full) + ';' + ($parts -join ';')), 'Machine')
+        Send-SuchWindowsEnvironmentChanged
+    }
+}
+
+function Remove-SuchWindowsCommandPath {
+    param([Parameter(Mandatory=$true)][string]$Directory)
+    $full = [System.IO.Path]::GetFullPath($Directory).TrimEnd([char[]]'\/')
+    $machinePath = [System.Environment]::GetEnvironmentVariable('Path', 'Machine')
+    $parts = @($machinePath -split ';' | Where-Object {
+        -not [string]::IsNullOrWhiteSpace($_) -and
+        -not $_.TrimEnd([char[]]'\/').Equals($full, [System.StringComparison]::OrdinalIgnoreCase)
+    })
+    [System.Environment]::SetEnvironmentVariable('Path', ($parts -join ';'), 'Machine')
+    Send-SuchWindowsEnvironmentChanged
+}
+
+
+function Get-SuchWindowsStartMenuPrograms {
+    return (Get-SuchWindowsKnownFolder -Name 'CommonPrograms')
+}
+
+function Get-SuchWindowsDesktop {
+    return (Get-SuchWindowsKnownFolder -Name 'CommonDesktopDirectory')
+}
+
+function Get-SuchWindowsLegacyInstallRoots {
+    $local = Get-SuchWindowsKnownFolder -Name 'LocalApplicationData'
+    return @([System.IO.Path]::GetFullPath((Join-Path $local 'Programs\Such')))
+}
+
+function Get-SuchWindowsLegacyShortcutPaths {
+    $userPrograms = Get-SuchWindowsKnownFolder -Name 'Programs'
+    $userDesktop = Get-SuchWindowsKnownFolder -Name 'Desktop'
+    return @(
+        (Join-Path $userPrograms 'Heritage Inc.\Such.lnk'),
+        (Join-Path $userDesktop 'Such.lnk')
+    )
+}
+
+function Stop-SuchWindowsProcessesInRoots {
+    param([Parameter(Mandatory=$true)][string[]]$Roots)
+    $normalized = @($Roots | ForEach-Object {
+        [System.IO.Path]::GetFullPath($_).TrimEnd([char[]]'\/') + [System.IO.Path]::DirectorySeparatorChar
+    })
+    foreach ($process in @(Get-Process -ErrorAction SilentlyContinue)) {
+        $inside = $false
+        try {
+            $path = $process.Path
+            if ([string]::IsNullOrWhiteSpace($path)) { continue }
+            $full = [System.IO.Path]::GetFullPath($path)
+            foreach ($root in $normalized) {
+                if ($full.StartsWith($root, [System.StringComparison]::OrdinalIgnoreCase)) { $inside=$true; break }
+            }
+            if ($inside) {
+                Write-Host ("Stopping installed Such process: {0} ({1})" -f $process.Id, $full)
+                Stop-Process -Id $process.Id -Force -ErrorAction Stop
+                try { Wait-Process -Id $process.Id -Timeout 10 -ErrorAction SilentlyContinue } catch {}
+            }
+        } catch {
+            if ($inside) { throw }
+        }
+    }
+}
+
+function Remove-SuchWindowsLegacyArtifacts {
+    foreach ($shortcut in @(Get-SuchWindowsLegacyShortcutPaths)) {
+        Remove-Item -LiteralPath $shortcut -Force -ErrorAction SilentlyContinue
+    }
+    Remove-Item -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\App Paths\Such.exe' -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-Item -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\HeritageSuch' -Recurse -Force -ErrorAction SilentlyContinue
+    foreach ($root in @(Get-SuchWindowsLegacyInstallRoots)) {
+        if (Test-Path -LiteralPath $root -PathType Container) {
+            $looksLikeSuch = (Test-Path -LiteralPath (Join-Path $root 'Such.exe') -PathType Leaf) -or
+                             (Test-Path -LiteralPath (Join-Path $root 'uninstall_windows.ps1') -PathType Leaf)
+            if ($looksLikeSuch) { Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction Stop }
+        }
+    }
+}
+
+function Test-SuchWindowsAdministrator {
+    $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = New-Object System.Security.Principal.WindowsPrincipal($identity)
+    return $principal.IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+function Assert-SuchWindowsAdministrator {
+    if (-not (Test-SuchWindowsAdministrator)) {
+        throw 'Such v1.1 installs under Program Files and requires Administrator. Re-run install_windows.cmd or uninstall_windows.cmd as Administrator.'
+    }
+}
+
+function Get-SuchWindowsSecurityStateRoot {
+    $programData = Get-SuchWindowsKnownFolder -Name 'CommonApplicationData'
+    return (Join-Path $programData 'Heritage\Such\Security')
+}
+
+function Get-SuchWindowsUserFontDir {
+    $local = Get-SuchWindowsKnownFolder -Name 'LocalApplicationData'
+    return (Join-Path $local 'Microsoft\Windows\Fonts')
+}
+
 function Get-SuchSourceRoot {
     param([Parameter(Mandatory=$true)][string]$ScriptRoot)
     return [System.IO.Path]::GetFullPath((Join-Path $ScriptRoot '..'))
@@ -162,6 +323,7 @@ function Resolve-SuchWindowsRuntime {
     return $null
 }
 
+
 function Get-SuchPeArchitecture {
     param([Parameter(Mandatory=$true)][string]$Path)
 
@@ -202,6 +364,7 @@ function Assert-SuchWindowsRuntimeArchitecture {
     Write-Host ("Private runtime  : {0} ({1})" -f $RuntimePath, $actual)
 }
 
+
 function Get-SuchWindowsWorkspace {
     param(
         [Parameter(Mandatory=$true)][string]$SourceRoot,
@@ -210,13 +373,8 @@ function Get-SuchWindowsWorkspace {
     )
 
     $base = $env:SUCH_BUILD_ROOT
-    if ([string]::IsNullOrWhiteSpace($base)) {
-        if ([string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
-            $base = Join-Path ([System.IO.Path]::GetTempPath()) 'SuchBuild'
-        } else {
-            $base = Join-Path $env:LOCALAPPDATA 'SuchBuild'
-        }
-    }
+    $usesSourceBuildRoot = [string]::IsNullOrWhiteSpace($base)
+    if ($usesSourceBuildRoot) { $base = Join-Path $SourceRoot 'build' }
     $base = [System.IO.Path]::GetFullPath($base)
 
     $sha256 = [System.Security.Cryptography.SHA256]::Create()
@@ -227,10 +385,11 @@ function Get-SuchWindowsWorkspace {
         $sha256.Dispose()
     }
     $sourceId = -join ($sourceHash[0..3] | ForEach-Object { $_.ToString('x2') })
-    $versionRoot = Join-Path $base ("v100-{0}" -f $sourceId)
-    $buildDir = Join-Path $versionRoot ("b-{0}-{1}" -f $Arch.ToLowerInvariant(), $Config.ToLowerInvariant())
-    $installDir = Join-Path $versionRoot ("i-{0}-{1}" -f $Arch.ToLowerInvariant(), $Config.ToLowerInvariant())
-    $consumerDir = Join-Path $versionRoot ("c-{0}-{1}" -f $Arch.ToLowerInvariant(), $Config.ToLowerInvariant())
+    $versionRoot = if ($usesSourceBuildRoot) { $base } else { Join-Path $base ("v110-{0}" -f $sourceId) }
+    $configSuffix = if ($Config -eq 'Release') { '' } else { '-' + $Config.ToLowerInvariant() }
+    $buildDir = Join-Path $versionRoot ("windows-{0}{1}" -f $Arch.ToLowerInvariant(), $configSuffix)
+    $installDir = Join-Path $versionRoot ("stage-windows-{0}{1}" -f $Arch.ToLowerInvariant(), $configSuffix)
+    $consumerDir = Join-Path $versionRoot ("consumer-windows-{0}{1}" -f $Arch.ToLowerInvariant(), $configSuffix)
     $sourceLink = Join-Path $versionRoot 'src'
 
     New-Item -ItemType Directory -Force -Path $versionRoot | Out-Null
@@ -283,7 +442,7 @@ function Get-SuchExpectedRuntimeSha256 {
         [Parameter(Mandatory=$true)][ValidateSet('windows-x64','linux-x64')][string]$Platform,
         [Parameter(Mandatory=$true)][string]$FileName
     )
-    $manifest = Join-Path $SourceRoot 'runtime\RUNTIME_SHA256_v1.0.0.txt'
+    $manifest = Join-Path $SourceRoot 'runtime\RUNTIME_SHA256_v1.1.7.txt'
     if (-not (Test-Path -LiteralPath $manifest -PathType Leaf)) {
         throw "Runtime SHA-256 manifest is missing: $manifest"
     }

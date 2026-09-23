@@ -5,5 +5,5 @@
 *.suo
 .DS_Store
 
-# Such v1.0 ships the approved Windows/Linux runtime artifacts in-repo.
+# Such v1.1 ships the approved Windows/Linux runtime artifacts in-repo.
 # Do not ignore /.runtime/.

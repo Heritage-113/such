@@ -20,7 +20,11 @@ struct ResponsiveMetrics {
     float top_padding = 0.0f;
     float bottom_padding = 0.0f;
     float search_height = 0.0f;
+    // Search remains the only top-level input surface. Security is a compact
+    // secondary control row immediately below it.
     float search_to_results_gap = 0.0f;
+    float security_height = 0.0f;
+    float security_to_results_gap = 0.0f;
 
     float row_height = 0.0f;
     float row_gap = 0.0f;
@@ -34,7 +38,7 @@ struct ResponsiveMetrics {
     float search_radius = 0.0f;
     float swipe_action_width = 0.0f;
 
-    // This is viewport capacity, not a search-result cap. v1.0 permits an
+    // This is viewport capacity, not a search-result cap. v1.1 permits an
     // unbounded result list and scrolls/virtualizes rows beyond this count.
     int visible_results = 0;
 };
@@ -42,6 +46,7 @@ struct ResponsiveMetrics {
 struct WindowLayout {
     ResponsiveMetrics metrics{};
     RectF search{};
+    RectF security{};
     RectF results_viewport{};
 
     // Compatibility preview for the first five rows. New frontend code should

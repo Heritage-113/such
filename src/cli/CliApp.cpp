@@ -11,9 +11,16 @@
 #include <cctype>
 #include <cstdio>
 #include <filesystem>
+#include <iostream>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
+#if defined(_WIN32)
+#include <io.h>
+#else
+#include <unistd.h>
+#endif
 
 namespace such::cli {
 namespace {
@@ -64,6 +71,57 @@ int print_runtime_error(const char* label, const std::string& error, int code) {
 bool is_verb(std::string_view value, std::initializer_list<std::string_view> names) {
     for (const auto name : names) if (value == name) return true;
     return false;
+}
+
+bool stdin_is_terminal() noexcept {
+#if defined(_WIN32)
+    return _isatty(_fileno(stdin)) != 0;
+#else
+    return isatty(fileno(stdin)) != 0;
+#endif
+}
+
+std::vector<std::string> split_interactive_command(std::string_view line) {
+    std::vector<std::string> arguments;
+    std::string current;
+    char quote = '\0';
+    for (std::size_t i = 0; i < line.size(); ++i) {
+        const char c = line[i];
+        if (quote != '\0') {
+            if (c == quote) { quote = '\0'; continue; }
+            if (c == '\\' && i + 1 < line.size() && line[i + 1] == quote) { current.push_back(line[++i]); continue; }
+            current.push_back(c);
+            continue;
+        }
+        if (c == '"' || c == '\'') { quote = c; continue; }
+        if (std::isspace(static_cast<unsigned char>(c)) != 0) {
+            if (!current.empty()) { arguments.push_back(std::move(current)); current.clear(); }
+            continue;
+        }
+        current.push_back(c);
+    }
+    if (!current.empty()) arguments.push_back(std::move(current));
+    return arguments;
+}
+
+int run_interactive(such::ui::PlatformDialect dialect) {
+    print_help();
+    std::string line;
+    while (true) {
+        std::printf("\nsuch> ");
+        std::fflush(stdout);
+        if (!std::getline(std::cin, line)) { std::printf("\n"); return 0; }
+        auto arguments = split_interactive_command(line);
+        if (arguments.empty()) continue;
+        const auto command = lower_ascii(arguments.front());
+        if (command == "exit" || command == "quit") return 0;
+        arguments.insert(arguments.begin(), "SuchCLI");
+        std::vector<char*> argv;
+        argv.reserve(arguments.size());
+        for (auto& argument : arguments) argv.push_back(argument.data());
+        const int result = run(static_cast<int>(argv.size()), argv.data(), dialect);
+        if (result != 0) std::fprintf(stderr, "command exited with code %d\n", result);
+    }
 }
 
 int mutate_file(such::runtime::RuntimeClient& runtime, std::string_view verb, const std::string& path) {
@@ -124,7 +182,11 @@ bool should_dispatch_from_gui(int argc, char* const* argv) noexcept {
 }
 
 int run(int argc, char* const* argv, such::ui::PlatformDialect dialect) {
-    if (argc <= 1) { print_help(); return 0; }
+    if (argc <= 1) {
+        if (stdin_is_terminal()) return run_interactive(dialect);
+        print_help();
+        return 0;
+    }
 
     const std::string first_raw = argv[1] ? argv[1] : "";
     const std::string first = lower_ascii(first_raw);
@@ -279,6 +341,14 @@ int run(int argc, char* const* argv, such::ui::PlatformDialect dialect) {
     if (!search_error.empty()) return print_runtime_error("search failed", search_error, 7);
     for (const auto& item : results) {
         std::printf("%s\t%s%s\n", item.filename.c_str(), item.path.c_str(), item.pinned ? "\tPIN" : "");
+        if (!item.content_match) continue;
+        if (!item.logical_name.empty()) std::printf("%s\n", item.logical_name.c_str());
+        else if (item.page_number != 0) std::printf("p. %u\n", item.page_number);
+        else if (item.slide_number != 0) std::printf("Slide %u\n", item.slide_number);
+        else if (item.sheet_number != 0) std::printf("Sheet %u\n", item.sheet_number);
+        else if (item.line_number != 0) std::printf("L%u\n", item.line_number);
+        else if (item.byte_offset != 0) std::printf("@%llu\n", static_cast<unsigned long long>(item.byte_offset));
+        if (!item.snippet.empty()) std::printf("%s\n", item.snippet.c_str());
     }
     return 0;
 }

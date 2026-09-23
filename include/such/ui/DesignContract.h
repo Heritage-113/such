@@ -4,7 +4,7 @@
 
 namespace such::ui::design {
 
-// v1.0: five is the compact-window design target, not a search-result cap.
+// v1.1: five is the compact-window design target, not a search-result cap.
 inline constexpr int kCompactViewportTarget = 5;
 inline constexpr float kSearchRadiusMin = 6.0f;
 inline constexpr float kSearchRadiusMax = 8.0f;

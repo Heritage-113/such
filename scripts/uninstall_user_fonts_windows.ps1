@@ -9,9 +9,10 @@ Set-StrictMode -Version Latest
 
 if (-not (Test-Path -LiteralPath $ManifestPath)) {
   Write-Host 'No Such-managed font manifest found; no fonts removed.'
-  exit 0
+  return
 }
 
+if (-not ('SuchFontUninstallNative' -as [type])) {
 Add-Type -TypeDefinition @'
 using System;
 using System.Runtime.InteropServices;
@@ -22,6 +23,7 @@ public static class SuchFontUninstallNative {
     public static extern IntPtr SendMessageTimeoutW(IntPtr hWnd, uint Msg, UIntPtr wParam, IntPtr lParam, uint flags, uint timeout, out UIntPtr result);
 }
 '@
+}
 
 $fontReg = 'HKCU:\Software\Microsoft\Windows NT\CurrentVersion\Fonts'
 $manifest = (Get-Content -LiteralPath $ManifestPath -Raw -Encoding UTF8) | ConvertFrom-Json
@@ -46,7 +48,7 @@ foreach ($entry in @($manifest.entries)) {
   if ([bool]$entry.ownedFile -and (Test-Path -LiteralPath $dest)) {
     $currentHash = (Get-FileHash -LiteralPath $dest -Algorithm SHA256).Hash.ToLowerInvariant()
     if ($currentHash -eq $hash) {
-      [void][SuchFontUninstallNative]::RemoveFontResourceExW($dest, 0u, [IntPtr]::Zero)
+      [void][SuchFontUninstallNative]::RemoveFontResourceExW($dest, [uint32]0, [IntPtr]::Zero)
       Remove-Item -LiteralPath $dest -Force -ErrorAction SilentlyContinue
       $removed++
     } else {

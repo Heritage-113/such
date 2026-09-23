@@ -4,6 +4,8 @@
 
 Such is a native local-search tool by Heritage Inc. Desktop support is **Windows x64 and Linux x64**. macOS desktop is not supported.
 
+Current public source snapshot: **v1.1.7**.
+
 https://such.heritage-labs.net
 
 ## CLI
@@ -33,9 +35,39 @@ Search needs no command:
 such structural drawing
 such /dwg plan
 such /20260901-20260919 invoice
+such /inside warranty
+such projectA /; /inside renderer
 ```
 
-The GUI also supports `/;` detail search and `/claude` / `/codex` agent launch. `SuchMCP` is fetched/built on demand and is **not** a required release artifact.
+The GUI supports `/;` detail search and `/claude` / `/codex` agent launch. `/inside` switches the query to indexed file contents. When `/inside` follows `/;`, the previous file-result set is passed to the private runtime as candidate file IDs instead of searching the whole corpus.
+
+`SuchMCP` is fetched and built on demand. It is not a required desktop release artifact.
+
+## Execution model
+
+Such is an **on-demand application**, not a resident service.
+
+The Windows and Linux build/install/release paths are checked so they do not register or ship background startup mechanisms such as:
+
+- Windows Run/RunOnce entries
+- Startup-folder launchers
+- scheduled tasks
+- Windows services
+- detached PowerShell background jobs
+- systemd units
+- XDG autostart entries
+
+GUI smoke verification also checks that a detached Such process is not left behind after the test window exits.
+
+Runtime loading is kept separate from index-policy mutation. Existing-index cleanup is not run synchronously from `RuntimeClient::ensure_ready()` during normal startup.
+
+## Secure Search
+
+The desktop UI exposes a compact **Security** toggle below the search field. Secure Search is fail-closed: ordinary local search remains available, but the toggle does not become active unless the private Heritage Secure Core returns an activated Enterprise security session.
+
+Heritage Secure Core is temporarily excluded from this public v1.1 line. In this build the Security toggle opens the Enterprise contact notice and does not activate Secure Search.
+
+On Windows, Such installs machine-wide under `C:\Heritage\Such`. AppData remains excluded from automatic indexing, but entering `%APPDATA%` or `%LOCALAPPDATA%` exactly in the Windows search field and pressing Enter explicitly opts that known folder into indexing. Common noise subtrees such as `node_modules`, `.git`, and `__pycache__` remain excluded.
 
 ## Benchmark
 
@@ -48,9 +80,9 @@ Controlled synthetic-file benchmark on:
 - glibc: 2.41
 - filesystem: overlayfs, with a second 100k-file run on tmpfs
 - baseline: GNU `find` 4.10.0
-- production runtime SHA-256: `76f3080395e9352a3fc1840ff221e3325d0c5cf93cfc30c0809cd2bbfa3a0a6a`
+- benchmark runtime SHA-256: `76f3080395e9352a3fc1840ff221e3325d0c5cf93cfc30c0809cd2bbfa3a0a6a`
 
-The table below compares a **warm persistent Such runtime** against warm-cache recursive GNU `find`. It is not a cold-start comparison.
+The table below compares a **warm loaded Such runtime** against warm-cache recursive GNU `find`. It is not a cold-start comparison.
 
 | Files | Query | Results | Such median | GNU find median | Ratio |
 |---:|:---|---:|---:|---:|---:|
@@ -69,7 +101,7 @@ The same 500k-file state occupied about **108.6 MiB**. Sequentially reading thos
 
 The same pattern persisted on tmpfs: at 100k files, raw state read was about **2 ms**, while runtime reload was about **100 ms**.
 
-That gap is evidence that Linux startup time is dominated by work **after raw I/O**. The current evidence does not identify the exact private-runtime function responsible, so likely causes such as deserialization, allocator pressure, hash/index reconstruction, cache misses, or synchronization contention remain hypotheses until native profiling confirms them. The fact that 5-CPU reload was slower than 1-CPU reload at 500k files also argues against treating this as a simple storage-bandwidth problem.
+That gap shows that Linux startup cost is dominated by work after raw I/O. The current evidence does not isolate the exact private-runtime function responsible. Native profiling is required before changing the storage format or adding a resident service.
 
 Full benchmark methodology and performance notes are in [`docs/LINUX_PERFORMANCE.md`](docs/LINUX_PERFORMANCE.md).
 
@@ -80,6 +112,8 @@ Linux:
 ```bash
 ./scripts/build_linux.sh --clean
 ```
+
+The Linux build is intentionally environment-sealed. Run it from any working directory; the script resolves the repository root from its own location and ignores caller-provided build/output/compiler/runtime overrides.
 
 Windows:
 
@@ -97,39 +131,37 @@ On an x86_64 Debian/Ubuntu-family host with the normal build dependencies instal
 ./scripts/build_deb.sh
 ```
 
-The package is written to:
+Release artifacts are written under `dist/artifacts/`. The DEB keeps the production runtime beside the real binaries under `/opt/such/bin`, while `/usr/bin/such` and `/usr/bin/SuchCLI` are launch wrappers. This preserves runtime discovery without requiring a global `LD_LIBRARY_PATH`.
 
-```text
-dist/artifacts/such_1.0.0_amd64.deb
-```
-
-The DEB keeps the production runtime beside the real binaries under `/opt/such/bin`, while `/usr/bin/such` and `/usr/bin/SuchCLI` are launch wrappers. This preserves the current runtime-discovery contract without requiring a global `LD_LIBRARY_PATH`.
+The v1.1.7 source snapshot retains the v1.1.7 build-directory, artifact-name, and runtime-hash manifest identifiers used by the current release scripts.
 
 ## Release runtime
 
-The v1.0 repository/release carries the approved desktop runtime artifacts used for production builds:
+The public repository carries the approved desktop runtime artifacts used for compatibility builds:
 
 ```text
 .runtime/
   windows-x64/SuchRuntimePrivate.dll
-  SuchRuntimePrivate_v0.6.2_Linux_x64_RuntimeOnly/libSuchRuntimePrivate.so
+  linux-x64/libSuchRuntimePrivate.so
 ```
 
-`build_linux.sh` accepts `RUNTIME_LIBRARY_PATH=/absolute/path/libSuchRuntimePrivate.so` and otherwise discovers the tracked Linux runtime under `.runtime/`. Approved hashes remain pinned in `runtime/RUNTIME_SHA256_v1.0.0.txt`. Linux legal notices are included with the Linux package.
+Linux builds use a sealed build context: repository-relative build/install directories, a fixed system tool search set, cleared compiler/linker/CMake override variables, and the compatibility runtime at `.runtime/linux-x64/libSuchRuntimePrivate.so`. Caller-provided build environment variables do not redirect the build. Approved compatibility-runtime hashes are pinned in `runtime/RUNTIME_SHA256_v1.1.7.txt`. `/inside` content search is an optional ABI-v1 extension and requires a compatible newer private runtime supplied separately.
+
+The production runtime binaries under `.runtime/` are separate Heritage Inc. artifacts and are not covered by the public Apache-2.0 source license.
 
 ## SDK and commercial integration
 
-The **Such SDK is private** and is not distributed through this public repository. If you need to embed Such search into another native application, integrate the private runtime, or discuss commercial deployment/support, contact Heritage Inc. through:
+The **Such SDK is private** and is not distributed through this public repository. For native embedding, private runtime integration, or commercial deployment/support, contact Heritage Inc. through:
 
 https://heritage-labs.net
 
-The public repository intentionally exposes only the stable public runtime boundary required by Such itself. Publication of that boundary does not publish the private SDK or production search/storage implementation.
+The public repository exposes the stable public boundary required by Such itself. Publication of that boundary does not publish the private SDK or production search/storage implementation.
 
 ## Open-source license
 
 The public Such source code, documentation, and public build tooling are licensed under the **Apache License, Version 2.0**. See [`LICENSE`](LICENSE) and [`NOTICE`](NOTICE).
 
-The production runtime binaries under `.runtime/` are **not licensed under Apache-2.0** and remain separate Heritage Inc. artifacts subject to separate terms. The private Such SDK is likewise outside the public Apache-2.0 grant.
+The production runtime binaries under `.runtime/` and the private Such SDK are outside the public Apache-2.0 grant.
 
 Contributions are governed by [`CONTRIBUTING.md`](CONTRIBUTING.md). Security issues should be reported according to [`SECURITY.md`](SECURITY.md). The public/private component boundary is documented in [`docs/PUBLIC_BOUNDARY.md`](docs/PUBLIC_BOUNDARY.md).
 

@@ -1,4 +1,4 @@
-# Linux performance notes — Such v1.0
+# Linux performance notes — Such v1.1
 
 ## Scope
 
@@ -13,7 +13,7 @@ Environment:
 - GNU findutils 4.10.0
 - overlayfs for the full run
 - tmpfs cross-check for the 100k-file load test
-- production runtime SHA-256 `76f3080395e9352a3fc1840ff221e3325d0c5cf93cfc30c0809cd2bbfa3a0a6a`
+- benchmark runtime SHA-256 (historical benchmark provenance) `76f3080395e9352a3fc1840ff221e3325d0c5cf93cfc30c0809cd2bbfa3a0a6a`
 
 CPU-profile rows were affinity-limited runs on the same host, not separate machines. GNU `find` timings used warm page cache. `cold-ish` runtime tests used `posix_fadvise(..., DONTNEED)` where available and are not equivalent to a reboot.
 

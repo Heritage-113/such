@@ -2,10 +2,18 @@
 #include <such/ui/DisplayScalePolicy.h>
 #include <such/ui/IndexCommands.h>
 #include <such/ui/SearchDialect.h>
+#include <such/ui/ResponsiveLayout.h>
+#include <such/security/SecureSearchGate.h>
+#include <such/runtime/IndexPathPolicy.h>
 
 #include <cstdlib>
+#include <filesystem>
+#include <system_error>
 #include <ctime>
 #include <iostream>
+#if defined(_WIN32)
+#include <process.h>
+#endif
 
 namespace {
 int fail(int code, const char* why) {
@@ -25,6 +33,17 @@ int main() {
     if (!quoted.argument.has_value() || *quoted.argument != "/media/My Drive") return fail(22, "quoted drive path");
     const auto quoted_single = parse_index_command("//index '/srv/Project Files'", PlatformDialect::UnixLike);
     if (!quoted_single.argument.has_value() || *quoted_single.argument != "/srv/Project Files") return fail(23, "single-quoted index path");
+
+    const auto appdata_cmd = parse_index_command("%APPDATA%", PlatformDialect::Windows);
+    if (!appdata_cmd.matched || appdata_cmd.kind != IndexCommandKind::AddRoot ||
+        !appdata_cmd.argument.has_value() || *appdata_cmd.argument != "%appdata%")
+        return fail(34, "manual APPDATA activation command");
+    const auto local_appdata_cmd = parse_index_command("%LOCALAPPDATA%", PlatformDialect::Windows);
+    if (!local_appdata_cmd.matched || local_appdata_cmd.kind != IndexCommandKind::AddRoot ||
+        !local_appdata_cmd.argument.has_value() || *local_appdata_cmd.argument != "%localappdata%")
+        return fail(35, "manual LOCALAPPDATA activation command");
+    if (parse_index_command("%APPDATA%", PlatformDialect::UnixLike).matched)
+        return fail(36, "APPDATA activation must remain Windows-only");
 
     const auto filter = parse_search_query("/pdf /week report", PlatformDialect::Windows, 1'800'000'000);
     if (filter.extensions.empty() || filter.text != "report") return fail(3, "legacy filter syntax");
@@ -62,6 +81,80 @@ int main() {
     if (unix_agent_suggestions.size() < 2 || unix_agent_suggestions[0].token.empty()) return fail(17, "universal AI autocomplete");
     const auto detail_suggestions = autocomplete("/;", PlatformDialect::UnixLike, {});
     if (detail_suggestions.empty() || detail_suggestions.front().token != "/;") return fail(18, "detail autocomplete");
+
+    const auto inside_windows = parse_search_query("/inside warranty", PlatformDialect::Windows, 1'800'000'000);
+    if (inside_windows.scope != SearchScope::Content || inside_windows.text != "warranty") return fail(24, "Windows /inside scope");
+    const auto inside_unix = parse_search_query("/inside warranty", PlatformDialect::UnixLike, 1'800'000'000);
+    if (inside_unix.scope != SearchScope::Content || inside_unix.text != "warranty") return fail(25, "Unix universal /inside scope");
+    const auto phrase_inside = parse_search_query("/inside \"force majeure\"", PlatformDialect::Windows, 1'800'000'000);
+    if (phrase_inside.scope != SearchScope::Content || phrase_inside.text != "\"force majeure\"") return fail(26, "inside phrase preservation");
+    const auto inside_suggestions = autocomplete("/in", PlatformDialect::UnixLike, {});
+    if (inside_suggestions.empty() || inside_suggestions.front().token != "/inside") return fail(27, "inside autocomplete");
+
+
+    if (!such::runtime::is_default_noise_directory_name("node_modules") ||
+        !such::runtime::is_default_noise_directory_name(".git") ||
+        !such::runtime::is_default_noise_directory_name("__pycache__") ||
+        such::runtime::is_default_noise_directory_name("source")) return fail(28, "default noise directory names");
+    if (!such::runtime::is_windows_manual_index_alias("%APPDATA%") ||
+        !such::runtime::is_windows_manual_index_alias("%localappdata%") ||
+        such::runtime::is_windows_manual_index_alias("APPDATA")) return fail(37, "Windows manual AppData aliases");
+    if (!such::runtime::is_windows_protected_index_path("C:\\Windows\\System32") ||
+        !such::runtime::is_windows_protected_index_path("c:/Program Files/Heritage") ||
+        !such::runtime::is_windows_protected_index_path("C:\\Users\\alice\\AppData\\Local\\Google\\Chrome") ||
+        !such::runtime::is_windows_protected_index_path("C:\\Projects\\demo\\node_modules\\pkg") ||
+        such::runtime::is_windows_protected_index_path("C:\\Users\\alice\\Documents\\Project") ||
+        such::runtime::is_windows_protected_index_path("D:\\Work\\AppDataModel")) return fail(29, "Windows protected index paths");
+
+    auto policy_parent = std::filesystem::temp_directory_path();
+#if defined(_WIN32)
+    // AppData\Local\Temp remains excluded from automatic indexing. CTest
+    // provides a writable, non-protected parent without assuming that the
+    // user's profile root accepts direct child creation.
+    wchar_t* fixture_parent = nullptr;
+    std::size_t fixture_parent_length = 0;
+    if (_wdupenv_s(&fixture_parent, &fixture_parent_length, L"SUCH_TEST_POLICY_PARENT") != 0 ||
+        fixture_parent == nullptr) {
+        return fail(30, "policy fixture parent");
+    }
+    policy_parent = std::filesystem::path(fixture_parent);
+    std::free(fixture_parent);
+#endif
+    const auto policy_root = policy_parent /
+#if defined(_WIN32)
+        ("such-policy-contract-" + std::to_string(_getpid()));
+#else
+        "such-policy-contract";
+#endif
+    std::error_code policy_ec;
+    std::filesystem::remove_all(policy_root, policy_ec);
+    std::filesystem::create_directories(policy_root / "src", policy_ec);
+    std::filesystem::create_directories(policy_root / "node_modules" / "pkg", policy_ec);
+    std::filesystem::create_directories(policy_root / ".git" / "objects", policy_ec);
+    std::filesystem::create_directories(policy_root / "py" / "__pycache__", policy_ec);
+    if (policy_ec) return fail(30, "policy fixture setup");
+    const auto policy = such::runtime::plan_default_index_policy(policy_root, true);
+    if (!policy.root_allowed || policy.exclusions.size() < 3u) return fail(31, "policy subtree discovery");
+    const auto rejected = such::runtime::plan_default_index_policy(policy_root / "node_modules", false);
+    if (rejected.root_allowed) return fail(32, "noise root rejection");
+    std::filesystem::remove_all(policy_root, policy_ec);
+
+
+    if (such::runtime::is_windows_protected_index_path("C:\\Heritage\\Such\\Such.exe"))
+        return fail(33, "C:\\Heritage\\Such must not require a self-exclusion rule");
+
+    const auto security_layout = compute_window_layout(760.0f, 600.0f);
+    if (security_layout.security.y <= security_layout.search.y + security_layout.search.height)
+        return fail(24, "Security row must sit below the search field");
+    if (security_layout.results_viewport.y <= security_layout.security.y + security_layout.security.height)
+        return fail(25, "Results must sit below the Security row");
+
+    such::security::SecureSearchGate security_gate;
+    std::string security_error;
+    if (security_gate.request_enable(security_error) !=
+        such::security::SecureSearchDecision::RequiresEnterpriseActivation)
+        return fail(26, "Security gate must fail closed without Enterprise provider");
+    if (security_gate.active()) return fail(27, "Security gate unexpectedly active");
 
     DisplayScaleInput linux_4k{};
     linux_4k.dpi = 96.0f; // common synthetic X11 value even on a 4K panel

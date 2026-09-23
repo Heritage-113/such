@@ -68,9 +68,9 @@ string(FIND "${_such_cmake_text}" "WINDOWS_EXPORT_ALL_SYMBOLS ON" _stub_exports)
 if(_stub_exports EQUAL -1)
   message(FATAL_ERROR "Windows ABI test stub must export symbols for GetProcAddress")
 endif()
-string(FIND "${_such_win_text}" "HeritageSuchV100Window" _v100_class)
-if(_v100_class EQUAL -1)
-  message(FATAL_ERROR "Win32 window class must carry the v1.0 identity to avoid stale class collisions")
+string(FIND "${_such_win_text}" "HeritageSuchV110Window" _v110_class)
+if(_v110_class EQUAL -1)
+  message(FATAL_ERROR "Win32 window class must carry the v1.1 identity to avoid stale class collisions")
 endif()
 string(FIND "${_such_win_text}" "#include <such/Version.h>" _version_header)
 if(_version_header EQUAL -1)
@@ -80,7 +80,7 @@ endif()
 
 # MSVC /W4 reports local-name reuse in chained if-init statements as C4456.
 # Keep the portable compiler warning set aligned with this rule and reject the
-# exact stale spellings that caused the v1.0 Windows build failure.
+# exact stale spellings that caused the v1.1 Windows build failure.
 foreach(_shadow_pattern
     "else if (const auto range = parse_compact_range_local"
     "else if (const auto range = parse_compact_day_as_range"

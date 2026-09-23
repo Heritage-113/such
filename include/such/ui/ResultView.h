@@ -24,6 +24,16 @@ enum class IconOverride : std::uint8_t {
     Favorite,
 };
 
+enum class ContentLocatorKind : std::uint8_t {
+    None = 0,
+    Line = 1,
+    Page = 2,
+    Slide = 3,
+    Sheet = 4,
+    Offset = 5,
+    Metadata = 6,
+};
+
 struct ResultItem {
     std::uint64_t file_id = 0;
     std::string filename;
@@ -36,6 +46,18 @@ struct ResultItem {
     IconOverride icon_override = IconOverride::SystemDefault;
     std::int64_t modified_unix_seconds = 0;
     std::uint64_t size_bytes = 0;
+
+    // Populated only for /inside results.
+    bool content_match = false;
+    ContentLocatorKind locator_kind = ContentLocatorKind::None;
+    std::uint32_t page_number = 0;
+    std::uint32_t line_number = 0;
+    std::uint32_t slide_number = 0;
+    std::uint32_t sheet_number = 0;
+    std::uint64_t byte_offset = 0;
+    std::string logical_name;
+    std::string snippet;
+    double content_score = 0.0;
 };
 
 // Visual verification only. Production frontends must not call this unless --demo

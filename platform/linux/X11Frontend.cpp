@@ -1,6 +1,7 @@
 #include <such/Version.h>
 #include <such/cli/CliApp.h>
 #include <such/runtime/RuntimeClient.h>
+#include <such/security/SecureSearchGate.h>
 #include <such/ui/AgentLauncher.h>
 #include <such/ui/DesignContract.h>
 #include <such/ui/DisplayScalePolicy.h>
@@ -76,6 +77,8 @@ struct UiState {
     std::uint64_t runtime_generation = 0;
     std::size_t runtime_indexed_files = 0;
     bool runtime_indexing = false;
+    such::security::SecureSearchGate security_gate;
+    bool security_notice_open = false;
     float scroll_dip = 0.0f;
     float ui_scale = 1.0f;
     such::ui::IndexCommandKind root_picker_kind = such::ui::IndexCommandKind::NoCommand;
@@ -97,10 +100,11 @@ such::ui::WindowLayout x11_layout(const UiState& state) {
     auto& m = out.metrics;
     auto mul = [scale](float& v) { v *= scale; };
     mul(m.width); mul(m.height); mul(m.side_padding); mul(m.top_padding); mul(m.bottom_padding);
-    mul(m.search_height); mul(m.search_to_results_gap); mul(m.row_height); mul(m.row_gap);
+    mul(m.search_height); mul(m.search_to_results_gap); mul(m.security_height); mul(m.security_to_results_gap); mul(m.row_height); mul(m.row_gap);
     mul(m.file_icon); mul(m.icon_gap); mul(m.extension_badge_height); mul(m.filename_font);
     mul(m.path_font); mul(m.corner_radius); mul(m.search_radius); mul(m.swipe_action_width);
     out.search = scale_rect(out.search, scale);
+    out.security = scale_rect(out.security, scale);
     out.results_viewport = scale_rect(out.results_viewport, scale);
     for (auto& row : out.rows) row = scale_rect(row, scale);
 
@@ -518,7 +522,7 @@ void draw_detail_tree(Display* d, Window w, GC gc, const UiState& state, const s
     const int branch_h = dip_px(state, 32.0f);
     const int gap = dip_px(state, 6.0f);
     const int indent_step = dip_px(state, 18.0f);
-    int y = static_cast<int>(layout.search.y + layout.search.height + dip_px(state, 8.0f));
+    int y = static_cast<int>(layout.security.y + layout.security.height + layout.metrics.security_to_results_gap);
     for (std::size_t i = 0; i < detail.refinements.size(); ++i) {
         const int indent = static_cast<int>(i + 1u) * indent_step;
         const int x = static_cast<int>(layout.search.x) + indent;
@@ -534,6 +538,131 @@ void draw_detail_tree(Display* d, Window w, GC gc, const UiState& state, const s
         draw_utf8(d, w, gc, x + dip_px(state, 12.0f), y + dip_px(state, 21.0f),
                   ellipsize_utf8(text, wbox - dip_px(state, 24.0f)));
         y += branch_h + gap;
+    }
+}
+
+
+bool point_in_rect(const such::ui::RectF& r, int x, int y) {
+    return static_cast<float>(x) >= r.x && static_cast<float>(x) < r.x + r.width &&
+           static_cast<float>(y) >= r.y && static_cast<float>(y) < r.y + r.height;
+}
+
+void draw_security_toggle(Display* d, Window w, GC gc, const UiState& state,
+                          const such::ui::WindowLayout& layout) {
+    const auto& r = layout.security;
+    const int y_mid = static_cast<int>(r.y + r.height * 0.5f);
+    set_color(d, gc, kDarkGreen);
+    draw_utf8(d, w, gc,
+              static_cast<int>(r.x + dip_px(state, 2.0f)),
+              y_mid + dip_px(state, 5.0f),
+              "Security");
+
+    const int switch_w = dip_px(state, 34.0f);
+    const int switch_h = dip_px(state, 18.0f);
+    const int switch_x = static_cast<int>(r.x) + dip_px(state, 72.0f);
+    const int switch_y = y_mid - switch_h / 2;
+    const bool active = state.security_gate.active();
+    fill_round_rect(d, w, gc, switch_x, switch_y, switch_w, switch_h, switch_h / 2,
+                    active ? kDarkGreen : kHairline);
+    const int knob = std::max(10, switch_h - dip_px(state, 4.0f));
+    const int knob_x = active
+        ? switch_x + switch_w - knob - dip_px(state, 2.0f)
+        : switch_x + dip_px(state, 2.0f);
+    const int knob_y = switch_y + (switch_h - knob) / 2;
+    fill_round_rect(d, w, gc, knob_x, knob_y, knob, knob, knob / 2, kBright);
+}
+
+such::ui::RectF security_notice_panel(const UiState& state) {
+    const float width = std::min(static_cast<float>(state.width) - dip_px(state, 32.0f),
+                                 static_cast<float>(dip_px(state, 520.0f)));
+    const float height = static_cast<float>(dip_px(state, 190.0f));
+    return {(static_cast<float>(state.width) - width) * 0.5f,
+            (static_cast<float>(state.height) - height) * 0.5f,
+            width, height};
+}
+
+such::ui::RectF security_notice_contact_button(const UiState& state) {
+    const auto panel = security_notice_panel(state);
+    return {panel.x + dip_px(state, 24.0f),
+            panel.y + panel.height - dip_px(state, 48.0f),
+            static_cast<float>(dip_px(state, 145.0f)),
+            static_cast<float>(dip_px(state, 30.0f))};
+}
+
+such::ui::RectF security_notice_cancel_button(const UiState& state) {
+    const auto panel = security_notice_panel(state);
+    return {panel.x + panel.width - dip_px(state, 104.0f),
+            panel.y + panel.height - dip_px(state, 48.0f),
+            static_cast<float>(dip_px(state, 80.0f)),
+            static_cast<float>(dip_px(state, 30.0f))};
+}
+
+void draw_security_notice(Display* d, Window w, GC gc, const UiState& state) {
+    if (!state.security_notice_open) return;
+    const auto panel = security_notice_panel(state);
+    fill_round_rect(d, w, gc, static_cast<int>(panel.x), static_cast<int>(panel.y),
+                    static_cast<int>(panel.width), static_cast<int>(panel.height),
+                    dip_px(state, 8.0f), kBright);
+    stroke_round_rect(d, w, gc, static_cast<int>(panel.x), static_cast<int>(panel.y),
+                      static_cast<int>(panel.width), static_cast<int>(panel.height),
+                      dip_px(state, 8.0f), kDarkGreen, dip_px(state, 1.0f));
+
+    set_color(d, gc, kDarkGreen);
+    draw_utf8(d, w, gc, static_cast<int>(panel.x) + dip_px(state, 24.0f),
+              static_cast<int>(panel.y) + dip_px(state, 38.0f),
+              "보안검색은 본사와 연락이 필요합니다.");
+    set_color(d, gc, kPathGreen);
+    draw_utf8(d, w, gc, static_cast<int>(panel.x) + dip_px(state, 24.0f),
+              static_cast<int>(panel.y) + dip_px(state, 70.0f),
+              "Enterprise Such needs connection to corporation");
+    draw_utf8(d, w, gc, static_cast<int>(panel.x) + dip_px(state, 24.0f),
+              static_cast<int>(panel.y) + dip_px(state, 98.0f),
+              such::security::kEnterpriseSecurityUrl);
+
+    const auto contact = security_notice_contact_button(state);
+    fill_round_rect(d, w, gc, static_cast<int>(contact.x), static_cast<int>(contact.y),
+                    static_cast<int>(contact.width), static_cast<int>(contact.height),
+                    dip_px(state, 5.0f), kDarkGreen);
+    set_color(d, gc, kBright);
+    draw_utf8(d, w, gc, static_cast<int>(contact.x) + dip_px(state, 12.0f),
+              static_cast<int>(contact.y) + dip_px(state, 21.0f), "Contact Heritage");
+
+    const auto cancel = security_notice_cancel_button(state);
+    fill_round_rect(d, w, gc, static_cast<int>(cancel.x), static_cast<int>(cancel.y),
+                    static_cast<int>(cancel.width), static_cast<int>(cancel.height),
+                    dip_px(state, 5.0f), kPaper);
+    stroke_round_rect(d, w, gc, static_cast<int>(cancel.x), static_cast<int>(cancel.y),
+                      static_cast<int>(cancel.width), static_cast<int>(cancel.height),
+                      dip_px(state, 5.0f), kHairline);
+    set_color(d, gc, kDarkGreen);
+    draw_utf8(d, w, gc, static_cast<int>(cancel.x) + dip_px(state, 15.0f),
+              static_cast<int>(cancel.y) + dip_px(state, 21.0f), "Cancel");
+}
+
+
+void request_security_toggle(UiState& state) {
+    if (state.security_gate.active()) {
+        (void)state.security_gate.request_disable();
+        state.security_notice_open = false;
+        return;
+    }
+
+    std::string error;
+    const auto decision = state.security_gate.request_enable(error);
+    if (decision == such::security::SecureSearchDecision::RequiresEnterpriseActivation) {
+        state.security_notice_open = true;
+        return;
+    }
+    if (decision == such::security::SecureSearchDecision::Denied) {
+        state.search_error = error.empty() ? "Secure Search activation was denied" : std::move(error);
+    }
+}
+
+void open_enterprise_url_linux() {
+    const pid_t pid = fork();
+    if (pid == 0) {
+        execlp("xdg-open", "xdg-open", such::security::kEnterpriseSecurityUrl, static_cast<char*>(nullptr));
+        _exit(127);
     }
 }
 
@@ -559,6 +688,7 @@ void draw(Display* d, Window w, GC gc, UiState& state) {
     const std::string label = state.query.empty() ? "2026 Heritage Inc." : state.query;
     draw_utf8(d, w, gc, static_cast<int>(sr.x + dip_px(state, 39.0f)), static_cast<int>(sr.y + sr.height / 2 + dip_px(state, 5.0f)),
               ellipsize_utf8(label, std::max(8, static_cast<int>(sr.width) - dip_px(state, 58.0f))));
+    draw_security_toggle(d, w, gc, state, layout);
     draw_detail_tree(d, w, gc, state, layout);
 
     const float stride = m.row_height + m.row_gap;
@@ -612,6 +742,8 @@ void draw(Display* d, Window w, GC gc, UiState& state) {
             draw_utf8(d, w, gc, px0 + dip_px(state, 120.0f), py0 + i * itemH + dip_px(state, 19.0f), s.label);
         }
     }
+
+    draw_security_notice(d, w, gc, state);
 }
 
 
@@ -823,6 +955,7 @@ int main(int argc, char** argv) {
         return 23;
     }
 
+
     std::string runtime_error;
     if (!state.demo && !state.runtime.load(&runtime_error)) {
         std::fprintf(stderr, "Such: index load failed: %s\n", runtime_error.c_str());
@@ -947,7 +1080,9 @@ int main(int argc, char** argv) {
                     n = XLookupString(&e.xkey, buf, static_cast<int>(sizeof(buf) - 1), &ks, nullptr);
                 }
                 if (ks == XK_Escape) {
-                    if (state.swipe.is_open() || !state.suggestions.empty()) {
+                    if (state.security_notice_open) {
+                        state.security_notice_open = false;
+                    } else if (state.swipe.is_open() || !state.suggestions.empty()) {
                         state.swipe.close();
                         state.suggestions.clear();
                     } else {
@@ -1005,6 +1140,23 @@ int main(int argc, char** argv) {
                     break;
                 }
                 if (e.xbutton.button != Button1) break;
+                if (state.security_notice_open) {
+                    if (point_in_rect(security_notice_contact_button(state), e.xbutton.x, e.xbutton.y)) {
+                        open_enterprise_url_linux();
+                        state.security_notice_open = false;
+                    } else if (point_in_rect(security_notice_cancel_button(state), e.xbutton.x, e.xbutton.y)) {
+                        state.security_notice_open = false;
+                    }
+                    draw(d, w, gc, state);
+                    break;
+                }
+                const auto security_layout = x11_layout(state);
+                if (point_in_rect(security_layout.security, e.xbutton.x, e.xbutton.y)) {
+                    request_security_toggle(state);
+                    state.swipe.close();
+                    draw(d, w, gc, state);
+                    break;
+                }
                 int action_row = -1;
                 such::ui::ResultAction action{};
                 if (hit_swipe_action(state, e.xbutton.x, e.xbutton.y, action_row, action)) {

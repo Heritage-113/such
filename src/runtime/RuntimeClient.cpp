@@ -1,7 +1,9 @@
 #include <such/runtime/RuntimeClient.h>
 #include <such/runtime/RuntimeABI.h>
+#include <such/runtime/IndexPathPolicy.h>
 
 #include <cstdlib>
+#include <array>
 #include <cstring>
 #include <algorithm>
 #include <cctype>
@@ -51,6 +53,23 @@ std::string path_to_utf8(const std::filesystem::path& path) {
 #else
     return path.string();
 #endif
+}
+
+struct RootRequest {
+    std::filesystem::path path;
+    IndexPolicyOverride override_mode = IndexPolicyOverride::None;
+};
+
+RootRequest resolve_root_request(const std::filesystem::path& requested) {
+#if defined(_WIN32)
+    const auto raw = path_to_utf8(requested);
+    if (is_windows_manual_index_alias(raw)) {
+        if (const auto resolved = resolve_windows_manual_index_alias(raw)) {
+            return {*resolved, IndexPolicyOverride::ExplicitCurrentUserAppData};
+        }
+    }
+#endif
+    return {requested, IndexPolicyOverride::None};
 }
 
 std::filesystem::path executable_directory() {
@@ -129,6 +148,78 @@ int append_result(void* user, const such_runtime_result_v1* value) {
     return 1;
 }
 
+
+bool path_component_equal(std::string_view lhs, std::string_view rhs) {
+    if (lhs.size() != rhs.size()) return false;
+    for (std::size_t i = 0; i < lhs.size(); ++i) {
+#if defined(_WIN32)
+        if (std::tolower(static_cast<unsigned char>(lhs[i])) !=
+            std::tolower(static_cast<unsigned char>(rhs[i]))) return false;
+#else
+        if (lhs[i] != rhs[i]) return false;
+#endif
+    }
+    return true;
+}
+
+std::optional<std::string> directory_prefix_for_component(std::string_view path, std::string_view target) {
+    std::size_t start = 0;
+    while (start < path.size()) {
+        while (start < path.size() && (path[start] == '/' || path[start] == '\\')) ++start;
+        if (start >= path.size()) break;
+        std::size_t end = start;
+        while (end < path.size() && path[end] != '/' && path[end] != '\\') ++end;
+        if (path_component_equal(path.substr(start, end - start), target)) {
+            return std::string(path.substr(0, end));
+        }
+        start = end + 1;
+    }
+    return std::nullopt;
+}
+
+struct NoiseScrubContext {
+    std::string_view target;
+    std::unordered_set<std::string> seen;
+    std::vector<std::string> directories;
+};
+
+int collect_noise_directory(void* user, const such_runtime_result_v1* value) {
+    if (user == nullptr || value == nullptr || value->path == nullptr) return 0;
+    auto* context = static_cast<NoiseScrubContext*>(user);
+    const auto prefix = directory_prefix_for_component(value->path, context->target);
+    if (!prefix.has_value()) return 1;
+    std::string key = *prefix;
+#if defined(_WIN32)
+    std::transform(key.begin(), key.end(), key.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+#endif
+    if (context->seen.insert(std::move(key)).second) context->directories.push_back(*prefix);
+    return 1;
+}
+
+int append_content_result(void* user, const such_runtime_content_result_v1* value) {
+    if (user == nullptr || value == nullptr) return 0;
+    auto* out = static_cast<std::vector<such::ui::ResultItem>*>(user);
+    such::ui::ResultItem item;
+    item.file_id = value->file_id;
+    item.filename = value->filename != nullptr ? value->filename : "";
+    item.path = value->path != nullptr ? value->path : "";
+    item.extension = value->extension != nullptr ? value->extension : "";
+    item.content_match = true;
+    item.locator_kind = static_cast<such::ui::ContentLocatorKind>(value->locator_kind);
+    item.page_number = value->page_number;
+    item.line_number = value->line_number;
+    item.slide_number = value->slide_number;
+    item.sheet_number = value->sheet_number;
+    item.byte_offset = value->byte_offset;
+    item.logical_name = value->logical_name != nullptr ? value->logical_name : "";
+    item.snippet = value->snippet != nullptr ? value->snippet : "";
+    item.content_score = value->score;
+    out->push_back(std::move(item));
+    return 1;
+}
+
 } // namespace
 
 struct RuntimeClient::Impl {
@@ -142,6 +233,7 @@ struct RuntimeClient::Impl {
     using ListStringsFn = int (*)(such_runtime_handle_v1, such_runtime_string_callback_v1, void*);
     using VoidHandleFn = void (*)(such_runtime_handle_v1);
     using SearchFn = int (*)(such_runtime_handle_v1, const char*, std::uint32_t, std::size_t, such_runtime_result_callback_v1, void*);
+    using ContentSearchFn = int (*)(such_runtime_handle_v1, const such_runtime_content_search_request_v1*, such_runtime_content_result_callback_v1, void*);
     using BoolMutationFn = int (*)(such_runtime_handle_v1, const char*, int);
     using StatusFn = int (*)(such_runtime_handle_v1, such_runtime_status_v1*);
     using EngineStatsFn = int (*)(such_runtime_handle_v1, such_runtime_engine_stats_v1*);
@@ -169,6 +261,7 @@ struct RuntimeClient::Impl {
         reindex_async_fn = nullptr;
         wait_for_idle_fn = nullptr;
         search_fn = nullptr;
+        search_content_fn = nullptr;
         set_pinned_fn = nullptr;
         set_indexed_fn = nullptr;
         status_fn = nullptr;
@@ -192,6 +285,17 @@ struct RuntimeClient::Impl {
         static_assert(sizeof(Fn) == sizeof(LibrarySymbol), "runtime function pointer size mismatch");
         std::memcpy(&out, &symbol, sizeof(out));
         return true;
+    }
+
+    template <class Fn>
+    void bind_optional(Fn& out, const char* name) {
+        const LibrarySymbol symbol = load_symbol(library, name);
+        if (symbol == nullptr) {
+            out = nullptr;
+            return;
+        }
+        static_assert(sizeof(Fn) == sizeof(LibrarySymbol), "runtime function pointer size mismatch");
+        std::memcpy(&out, &symbol, sizeof(out));
     }
 
     bool ensure_loaded() {
@@ -227,6 +331,9 @@ struct RuntimeClient::Impl {
             const std::string bind_error = error;
             return fail_and_reset(bind_error);
         }
+        // Content search is an ABI-v1 extension. Its absence must not prevent
+        // older runtimes from serving ordinary file searches.
+        bind_optional(search_content_fn, "such_runtime_search_content_v1");
         if (abi_version() != SUCH_RUNTIME_ABI_VERSION) {
             return fail_and_reset("Such private runtime ABI version mismatch");
         }
@@ -247,6 +354,72 @@ struct RuntimeClient::Impl {
         }
         ready = true;
         error.clear();
+        return true;
+    }
+
+    void apply_existing_index_policy() {
+        if (runtime == nullptr || set_indexed_fn == nullptr) return;
+
+        // Fast fixed-path migration for existing roots. This immediately hides
+        // old AppData/Windows rows after an upgrade without requiring a full
+        // reindex. New root mutations still run the full pre-crawl discovery.
+        std::vector<std::string> root_values;
+        if (list_roots_fn != nullptr && list_roots_fn(runtime, append_string, &root_values) != 0) {
+            for (const auto& value : root_values) {
+                const auto root_path = std::filesystem::path(value);
+                const auto mode = is_current_user_manual_appdata_root(root_path)
+                    ? IndexPolicyOverride::ExplicitCurrentUserAppData
+                    : IndexPolicyOverride::None;
+                const auto plan = plan_default_index_policy(root_path, false, mode);
+                if (!plan.root_allowed) {
+                    (void)set_indexed_fn(runtime, value.c_str(), 0);
+                    continue;
+                }
+                for (const auto& excluded : plan.exclusions) {
+                    const auto path = path_to_utf8(excluded);
+                    (void)set_indexed_fn(runtime, path.c_str(), 0);
+                }
+            }
+        }
+
+        // Existing catalogs from older builds may already contain dependency
+        // trees. Find their concrete directory prefixes through the file index,
+        // then convert them to persistent subtree exclusions. Subsequent starts
+        // see no matching rows, so this migration becomes three cheap queries.
+        const std::array<std::string_view, 3> noise{{"node_modules", ".git", "__pycache__"}};
+#if defined(_WIN32)
+        constexpr std::uint32_t raw_dialect = 0u;
+#else
+        constexpr std::uint32_t raw_dialect = 1u;
+#endif
+        for (const auto name : noise) {
+            NoiseScrubContext context{name, {}, {}};
+            if (search_fn(runtime, std::string(name).c_str(), raw_dialect, 0, collect_noise_directory, &context) == 0) continue;
+            for (const auto& directory : context.directories) {
+                (void)set_indexed_fn(runtime, directory.c_str(), 0);
+            }
+        }
+    }
+
+    bool apply_index_policy(const std::filesystem::path& root,
+                            bool discover_noise_directories,
+                            IndexPolicyOverride override_mode,
+                            std::string* out_error) {
+        const auto plan = plan_default_index_policy(root, discover_noise_directories, override_mode);
+        if (!plan.root_allowed) {
+            error = plan.rejection_reason.empty() ? "Search root is blocked by the default index policy" : plan.rejection_reason;
+            if (out_error != nullptr) *out_error = error;
+            return false;
+        }
+        for (const auto& excluded : plan.exclusions) {
+            const auto value = path_to_utf8(excluded);
+            if (set_indexed_fn(runtime, value.c_str(), 0) == 0) {
+                const auto abi = abi_error();
+                error = abi.empty() ? "Such could not apply a default index exclusion: " + value : abi;
+                if (out_error != nullptr) *out_error = error;
+                return false;
+            }
+        }
         return true;
     }
 
@@ -280,6 +453,7 @@ struct RuntimeClient::Impl {
     VoidHandleFn reindex_async_fn = nullptr;
     VoidHandleFn wait_for_idle_fn = nullptr;
     SearchFn search_fn = nullptr;
+    ContentSearchFn search_content_fn = nullptr;
     BoolMutationFn set_pinned_fn = nullptr;
     BoolMutationFn set_indexed_fn = nullptr;
     StatusFn status_fn = nullptr;
@@ -304,7 +478,9 @@ std::string RuntimeClient::last_error() const { return impl_->runtime_error(); }
 
 bool RuntimeClient::add_root(const std::filesystem::path& root, std::string* error) {
     if (!impl_->ensure_ready()) { if (error != nullptr) *error = impl_->runtime_error(); return false; }
-    const auto path = path_to_utf8(root);
+    const auto request = resolve_root_request(root);
+    if (!impl_->apply_index_policy(request.path, true, request.override_mode, error)) return false;
+    const auto path = path_to_utf8(request.path);
     const bool ok = impl_->add_root_fn(impl_->runtime, path.c_str()) != 0;
     if (ok) impl_->error.clear();
     else if (error != nullptr) *error = impl_->runtime_error();
@@ -322,11 +498,18 @@ bool RuntimeClient::remove_root(const std::filesystem::path& root, std::string* 
 
 bool RuntimeClient::replace_roots(const std::vector<std::filesystem::path>& roots_value, std::string* error) {
     if (!impl_->ensure_ready()) { if (error != nullptr) *error = impl_->runtime_error(); return false; }
+    std::vector<RootRequest> requests;
+    requests.reserve(roots_value.size());
+    for (const auto& root : roots_value) {
+        auto request = resolve_root_request(root);
+        if (!impl_->apply_index_policy(request.path, true, request.override_mode, error)) return false;
+        requests.push_back(std::move(request));
+    }
     std::vector<std::string> storage;
     std::vector<const char*> pointers;
-    storage.reserve(roots_value.size());
-    pointers.reserve(roots_value.size());
-    for (const auto& root : roots_value) storage.push_back(path_to_utf8(root));
+    storage.reserve(requests.size());
+    pointers.reserve(requests.size());
+    for (const auto& request : requests) storage.push_back(path_to_utf8(request.path));
     for (const auto& value : storage) pointers.push_back(value.c_str());
     const bool ok = impl_->replace_roots_fn(impl_->runtime, pointers.data(), pointers.size()) != 0;
     if (ok) impl_->error.clear();
@@ -352,7 +535,19 @@ std::vector<std::string> RuntimeClient::roots(std::string* error) const {
 }
 
 void RuntimeClient::reindex_async() {
-    if (impl_->ready && impl_->runtime != nullptr && impl_->reindex_async_fn != nullptr) impl_->reindex_async_fn(impl_->runtime);
+    if (!impl_->ready || impl_->runtime == nullptr || impl_->reindex_async_fn == nullptr) return;
+    std::vector<std::string> root_values;
+    if (impl_->list_roots_fn != nullptr && impl_->list_roots_fn(impl_->runtime, append_string, &root_values) != 0) {
+        for (const auto& value : root_values) {
+            const auto root_path = std::filesystem::path(value);
+            const auto mode = is_current_user_manual_appdata_root(root_path)
+                ? IndexPolicyOverride::ExplicitCurrentUserAppData
+                : IndexPolicyOverride::None;
+            std::string ignored_error;
+            (void)impl_->apply_index_policy(root_path, true, mode, &ignored_error);
+        }
+    }
+    impl_->reindex_async_fn(impl_->runtime);
 }
 void RuntimeClient::wait_for_idle() {
     if (impl_->ready && impl_->runtime != nullptr && impl_->wait_for_idle_fn != nullptr) impl_->wait_for_idle_fn(impl_->runtime);
@@ -363,77 +558,213 @@ std::vector<such::ui::ResultItem> RuntimeClient::search(
     such::ui::PlatformDialect dialect,
     std::size_t max_results,
     std::string* error) const {
-    std::vector<such::ui::ResultItem> raw;
     if (!impl_->ready || impl_->runtime == nullptr || impl_->search_fn == nullptr) {
         if (error != nullptr) *error = impl_->runtime_error();
-        return raw;
-    }
-
-    // The public query dialect is deliberately a compatibility layer in front
-    // of the private runtime ABI. New public syntax can therefore ship without
-    // rebuilding the runtime as long as it can be lowered to the stable query
-    // vocabulary. Post-filtering below is also a safety net for older runtimes.
-    const auto now = static_cast<std::int64_t>(std::time(nullptr));
-    const auto filter = such::ui::parse_search_query(query, dialect, now, observed_extensions());
-    const std::string runtime_query = such::ui::compile_runtime_query(filter, dialect);
-    const auto raw_dialect = dialect == such::ui::PlatformDialect::Windows ? 0u : 1u;
-
-    // Filtering can discard rows after the runtime ranked them. Ask for a
-    // moderately wider candidate set when the caller requested a finite cap.
-    const std::size_t candidate_limit = max_results == 0
-        ? 0
-        : std::max<std::size_t>(max_results,
-              std::min<std::size_t>(max_results > 512u ? 4096u : max_results * 8u, 4096u));
-    if (impl_->search_fn(impl_->runtime, runtime_query.c_str(), raw_dialect, candidate_limit, append_result, &raw) == 0) {
-        const std::string abi = impl_->abi_error();
-        impl_->error = abi.empty() ? "Such private runtime search failed" : abi;
-        if (error != nullptr) *error = impl_->error;
         return {};
     }
-    impl_->error.clear();
-    if (error != nullptr) error->clear();
 
-    std::unordered_set<std::string> wanted_extensions;
-    wanted_extensions.reserve(filter.extensions.size());
-    for (auto ext : filter.extensions) {
-        std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-        if (!ext.empty() && ext.front() == '.') ext.erase(ext.begin());
-        wanted_extensions.insert(std::move(ext));
-    }
+    const auto now = static_cast<std::int64_t>(std::time(nullptr));
+    const auto observed = observed_extensions();
+    const auto raw_dialect = dialect == such::ui::PlatformDialect::Windows ? 0u : 1u;
 
     auto lower_copy = [](std::string value) {
-        std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
+            return static_cast<char>(std::tolower(c));
+        });
         return value;
     };
 
-    std::vector<std::string> detail_terms;
-    detail_terms.reserve(filter.detail_terms.size());
-    for (const auto& term : filter.detail_terms) detail_terms.push_back(lower_copy(term));
+    auto search_files = [&](std::string_view file_query, std::size_t result_limit, std::string* local_error) {
+        std::vector<such::ui::ResultItem> raw;
+        const auto filter = such::ui::parse_search_query(file_query, dialect, now, observed);
+        const std::string runtime_query = such::ui::compile_runtime_query(filter, dialect);
 
-    std::vector<such::ui::ResultItem> out;
-    out.reserve(raw.size());
-    for (auto& item : raw) {
-        if (filter.pinned_only && !item.pinned) continue;
-        if (!wanted_extensions.empty()) {
-            std::string ext = item.extension;
-            std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        // Filtering can discard rows after runtime ranking. Ask for a wider
+        // candidate set when a finite cap was requested.
+        const std::size_t candidate_limit = result_limit == 0
+            ? 0
+            : std::max<std::size_t>(result_limit,
+                  std::min<std::size_t>(result_limit > 512u ? 4096u : result_limit * 8u, 4096u));
+        if (impl_->search_fn(impl_->runtime, runtime_query.c_str(), raw_dialect, candidate_limit, append_result, &raw) == 0) {
+            const std::string abi = impl_->abi_error();
+            impl_->error = abi.empty() ? "Such private runtime search failed" : abi;
+            if (local_error != nullptr) *local_error = impl_->error;
+            return std::vector<such::ui::ResultItem>{};
+        }
+
+        std::unordered_set<std::string> wanted_extensions;
+        wanted_extensions.reserve(filter.extensions.size());
+        for (auto ext : filter.extensions) {
+            std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) {
+                return static_cast<char>(std::tolower(c));
+            });
             if (!ext.empty() && ext.front() == '.') ext.erase(ext.begin());
-            if (!wanted_extensions.contains(ext)) continue;
+            wanted_extensions.insert(std::move(ext));
         }
-        if (filter.modified.after_unix_seconds.has_value() && item.modified_unix_seconds < *filter.modified.after_unix_seconds) continue;
-        if (filter.modified.before_unix_seconds.has_value() && item.modified_unix_seconds >= *filter.modified.before_unix_seconds) continue;
-        if (!detail_terms.empty()) {
-            const std::string haystack = lower_copy(item.filename + "\n" + item.path);
-            bool detail_match = true;
-            for (const auto& term : detail_terms) {
-                if (!term.empty() && haystack.find(term) == std::string::npos) { detail_match = false; break; }
+
+        std::vector<std::string> detail_terms;
+        detail_terms.reserve(filter.detail_terms.size());
+        for (const auto& term : filter.detail_terms) detail_terms.push_back(lower_copy(term));
+
+        std::vector<such::ui::ResultItem> out;
+        out.reserve(raw.size());
+        for (auto& item : raw) {
+            if (filter.pinned_only && !item.pinned) continue;
+            if (!wanted_extensions.empty()) {
+                std::string ext = item.extension;
+                std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) {
+                    return static_cast<char>(std::tolower(c));
+                });
+                if (!ext.empty() && ext.front() == '.') ext.erase(ext.begin());
+                if (!wanted_extensions.contains(ext)) continue;
             }
-            if (!detail_match) continue;
+            if (filter.modified.after_unix_seconds.has_value() &&
+                item.modified_unix_seconds < *filter.modified.after_unix_seconds) continue;
+            if (filter.modified.before_unix_seconds.has_value() &&
+                item.modified_unix_seconds >= *filter.modified.before_unix_seconds) continue;
+            if (!detail_terms.empty()) {
+                const std::string haystack = lower_copy(item.filename + "\n" + item.path);
+                bool detail_match = true;
+                for (const auto& term : detail_terms) {
+                    if (!term.empty() && haystack.find(term) == std::string::npos) {
+                        detail_match = false;
+                        break;
+                    }
+                }
+                if (!detail_match) continue;
+            }
+            out.push_back(std::move(item));
+            if (result_limit != 0 && out.size() >= result_limit) break;
         }
-        out.push_back(std::move(item));
-        if (max_results != 0 && out.size() >= max_results) break;
+        impl_->error.clear();
+        if (local_error != nullptr) local_error->clear();
+        return out;
+    };
+
+    auto search_content = [&](const such::ui::SearchFilter& filter,
+                              std::vector<std::uint64_t> candidate_ids,
+                              bool candidate_set_is_restrictive,
+                              std::string* local_error) {
+        if (impl_->search_content_fn == nullptr) {
+            impl_->error = "Such /inside requires a content-search capable private runtime (v0.7.0 or newer)";
+            if (local_error != nullptr) *local_error = impl_->error;
+            return std::vector<such::ui::ResultItem>{};
+        }
+        if (filter.text.empty()) {
+            impl_->error.clear();
+            if (local_error != nullptr) local_error->clear();
+            return std::vector<such::ui::ResultItem>{};
+        }
+
+        // Direct content queries can still carry file-level constraints such as
+        // /docx, /pin or dates. Resolve those constraints into a candidate set
+        // before entering the content engine rather than post-filtering hits.
+        if (!candidate_set_is_restrictive) {
+            such::ui::SearchFilter candidate_filter = filter;
+            candidate_filter.scope = such::ui::SearchScope::File;
+            candidate_filter.text.clear();
+            candidate_filter.detail_terms.clear();
+            const bool has_file_constraints = candidate_filter.pinned_only ||
+                !candidate_filter.extensions.empty() ||
+                candidate_filter.modified.after_unix_seconds.has_value() ||
+                candidate_filter.modified.before_unix_seconds.has_value();
+            if (has_file_constraints) {
+                const std::string candidate_query = such::ui::compile_runtime_query(candidate_filter, dialect);
+                std::string candidate_error;
+                const auto candidates = search_files(candidate_query, 0, &candidate_error);
+                if (!candidate_error.empty()) {
+                    if (local_error != nullptr) *local_error = candidate_error;
+                    return std::vector<such::ui::ResultItem>{};
+                }
+                if (candidates.empty()) {
+                    impl_->error.clear();
+                    if (local_error != nullptr) local_error->clear();
+                    return std::vector<such::ui::ResultItem>{};
+                }
+                candidate_ids.reserve(candidates.size());
+                for (const auto& item : candidates) candidate_ids.push_back(item.file_id);
+                candidate_set_is_restrictive = true;
+            }
+        }
+
+        such_runtime_content_search_request_v1 request{};
+        request.query_utf8 = filter.text.c_str();
+        request.candidate_file_ids = candidate_set_is_restrictive ? candidate_ids.data() : nullptr;
+        request.candidate_file_count = candidate_set_is_restrictive ? candidate_ids.size() : 0;
+        request.max_results = max_results;
+        request.flags = 0;
+
+        std::vector<such::ui::ResultItem> out;
+        if (impl_->search_content_fn(impl_->runtime, &request, append_content_result, &out) == 0) {
+            const std::string abi = impl_->abi_error();
+            impl_->error = abi.empty() ? "Such private runtime content search failed" : abi;
+            if (local_error != nullptr) *local_error = impl_->error;
+            return std::vector<such::ui::ResultItem>{};
+        }
+        impl_->error.clear();
+        if (local_error != nullptr) local_error->clear();
+        return out;
+    };
+
+    // Drill Search becomes a real staged plan when the final branch is /inside:
+    // preceding file branches form a ResultSet, then the content runtime searches
+    // only those file IDs. Content scope in the middle of a tree is deliberately
+    // rejected until a subsequent content->file stage has explicit semantics.
+    const auto detail = such::ui::parse_detail_search(query);
+    if (detail.active) {
+        std::vector<std::string> stages;
+        stages.reserve(detail.refinements.size() + 1u);
+        stages.push_back(detail.primary);
+        stages.insert(stages.end(), detail.refinements.begin(), detail.refinements.end());
+
+        std::size_t content_stage = stages.size();
+        for (std::size_t i = 0; i < stages.size(); ++i) {
+            const auto stage_filter = such::ui::parse_search_query(stages[i], dialect, now, observed);
+            if (stage_filter.scope == such::ui::SearchScope::Content) {
+                content_stage = i;
+                break;
+            }
+        }
+        if (content_stage != stages.size()) {
+            if (content_stage + 1u != stages.size()) {
+                impl_->error = "/inside must be the final Drill Search stage";
+                if (error != nullptr) *error = impl_->error;
+                return {};
+            }
+
+            std::vector<std::uint64_t> candidate_ids;
+            bool restricted = false;
+            if (content_stage > 0u) {
+                std::string candidate_query = stages.front();
+                for (std::size_t i = 1; i < content_stage; ++i) {
+                    candidate_query += " /; ";
+                    candidate_query += stages[i];
+                }
+                std::string candidate_error;
+                const auto candidates = search_files(candidate_query, 0, &candidate_error);
+                if (!candidate_error.empty()) {
+                    if (error != nullptr) *error = candidate_error;
+                    return {};
+                }
+                if (candidates.empty()) {
+                    impl_->error.clear();
+                    if (error != nullptr) error->clear();
+                    return {};
+                }
+                candidate_ids.reserve(candidates.size());
+                for (const auto& item : candidates) candidate_ids.push_back(item.file_id);
+                restricted = true;
+            }
+            const auto content_filter = such::ui::parse_search_query(stages[content_stage], dialect, now, observed);
+            return search_content(content_filter, std::move(candidate_ids), restricted, error);
+        }
     }
-    return out;
+
+    const auto filter = such::ui::parse_search_query(query, dialect, now, observed);
+    if (filter.scope == such::ui::SearchScope::Content) {
+        return search_content(filter, {}, false, error);
+    }
+    return search_files(query, max_results, error);
 }
 
 std::vector<std::string> RuntimeClient::observed_extensions() const {

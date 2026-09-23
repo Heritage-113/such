@@ -5,6 +5,14 @@ param(
 )
 $ErrorActionPreference='Stop'
 Set-StrictMode -Version Latest
+
+trap {
+  Write-Host ''
+  Write-Host ('[SUCH:FATAL] ' + $_.Exception.Message) -ForegroundColor Red
+  if ($_.InvocationInfo -and $_.InvocationInfo.PositionMessage) { Write-Host $_.InvocationInfo.PositionMessage -ForegroundColor DarkRed }
+  if (-not [string]::IsNullOrWhiteSpace($_.ScriptStackTrace)) { Write-Host $_.ScriptStackTrace -ForegroundColor DarkRed }
+  exit 1
+}
 $PreflightRoot=[System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 & (Join-Path $PSScriptRoot 'audit_windows.ps1') -SourceRoot $PreflightRoot
 . (Join-Path $PSScriptRoot 'windows_paths.ps1')

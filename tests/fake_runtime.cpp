@@ -61,6 +61,26 @@ int such_runtime_search_v1(such_runtime_handle_v1 h, const char*, uint32_t, size
   const such_runtime_result_v1 r{7,"project_report.pdf","/stub/project_report.pdf","pdf",1,1,1,1700000000,1234};
   return cb(u,&r) ? 1 : 1;
 }
+int such_runtime_search_content_v1(
+    such_runtime_handle_v1 h,
+    const such_runtime_content_search_request_v1* req,
+    such_runtime_content_result_callback_v1 cb,
+    void* u) {
+    if (!h || !req || !req->query_utf8 || !cb) return 0;
+    ptr(h)->error.clear();
+    bool candidate_ok = req->candidate_file_count == 0;
+    for (size_t i = 0; i < req->candidate_file_count; ++i) {
+        if (req->candidate_file_ids != nullptr && req->candidate_file_ids[i] == 7) candidate_ok = true;
+    }
+    if (!candidate_ok || *req->query_utf8 == '\0') return 1;
+    const std::string query(req->query_utf8);
+    if (query.find("warranty") == std::string::npos && query.find("renderer") == std::string::npos) return 1;
+    const such_runtime_content_result_v1 r{
+        7, "project_report.docx", "/stub/project_report.docx", "docx",
+        SUCH_CONTENT_LOCATOR_LINE, 0, 42, 0, 0, 128, "",
+        "warranty renderer content", 1.0};
+    return cb(u, &r) ? 1 : 1;
+}
 int such_runtime_set_pinned_v1(such_runtime_handle_v1 h, const char*, int) { return h ? 1 : 0; }
 int such_runtime_set_indexed_v1(such_runtime_handle_v1 h, const char*, int) { return h ? 1 : 0; }
 int such_runtime_status_v1_fn(such_runtime_handle_v1 h, such_runtime_status_v1* s) { if (!h || !s) return 0; s->indexing=0; s->indexed_files=1; s->generation=ptr(h)->generation; return 1; }

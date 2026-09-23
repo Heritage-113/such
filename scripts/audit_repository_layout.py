@@ -20,7 +20,7 @@ allowed_roots = {Path(entry).parts[0] for entry in manifest}
 # Repository/CI metadata and generated/local outputs are not distributable
 # package payload. Keep them outside PACKAGE_MANIFEST instead of forcing the
 # product manifest to know about GitHub Actions implementation details.
-ignored_roots = {'.git', '.github', '.cache', '.runtime', 'build', 'dist'}
+ignored_roots = {'.git', '.github', '.cache', '.runtime', '.secure', 'build', 'dist'}
 
 bad = []
 missing = []

@@ -34,6 +34,62 @@ foreach ($file in $psFiles) {
   }
 }
 
+# Windows PowerShell 5.1 compatibility: nested .NET types must be fully qualified.
+foreach ($file in $psFiles) {
+  $text = Get-Content -LiteralPath $file.FullName -Raw
+  if ($text -match '\[Environment\+SpecialFolder\]') {
+    Fail-Audit "$($file.Name): use the fully qualified System.Environment+SpecialFolder type."
+  }
+  if ($text -match '\b[0-9]+u\b') {
+    Fail-Audit "$($file.Name): unsigned integer literal suffixes are unsupported by Windows PowerShell 5.1."
+  }
+}
+
+# Build/install scripts must not depend directly on APPDATA environment variables.
+# Use Windows known-folder APIs instead so stripped/custom shells do not crash.
+foreach ($file in $psFiles) {
+  if ($file.Name -eq 'audit_windows.ps1') { continue }
+  $text = Get-Content -LiteralPath $file.FullName -Raw
+  if ($text -match '\$env:(?:APPDATA|LOCALAPPDATA)') {
+    Fail-Audit "$($file.Name): direct APPDATA/LOCALAPPDATA environment access is forbidden; use a known-folder resolver."
+  }
+}
+
+# Such is an on-demand application, not a resident service. Product scripts must
+# never register logon/startup hooks, scheduled tasks, or Windows services. The
+# audit script itself is excluded because it contains the detection patterns.
+$backgroundRegistrationPatterns = @(
+  @{ Pattern = 'CurrentVersion\\(?:Run|RunOnce)'; Why = 'Run/RunOnce autorun registration is forbidden.' },
+  @{ Pattern = '(?:^|[\\/])Startup(?:[\\/]|$)'; Why = 'Startup-folder autorun registration is forbidden.' },
+  @{ Pattern = '\b(?:Register-ScheduledTask|New-ScheduledTask|schtasks(?:\.exe)?\s+/(?:Create|Change))\b'; Why = 'Scheduled-task registration is forbidden.' },
+  @{ Pattern = '\b(?:New-Service|Set-Service|sc(?:\.exe)?\s+(?:create|config|start)|CreateService)\b'; Why = 'Windows service registration/start is forbidden.' },
+  @{ Pattern = '\bStart-Job\b'; Why = 'Detached PowerShell background jobs are forbidden in product scripts.' }
+)
+foreach ($file in $psFiles) {
+  if ($file.Name -eq 'audit_windows.ps1') { continue }
+  $text = Get-Content -LiteralPath $file.FullName -Raw
+  foreach ($rule in $backgroundRegistrationPatterns) {
+    if ([regex]::IsMatch($text, $rule.Pattern, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)) {
+      Fail-Audit "$($file.Name): $($rule.Why)"
+    }
+  }
+}
+foreach ($file in (Get-ChildItem -LiteralPath (Join-Path $SourceRoot 'scripts') -Filter '*.cmd' -File)) {
+  $text = Get-Content -LiteralPath $file.FullName -Raw
+  if ($text -match '(?i)\bschtasks(?:\.exe)?\s+/(?:Create|Change)\b|\bsc(?:\.exe)?\s+(?:create|config|start)\b') {
+    Fail-Audit "$($file.Name): background service/task registration is forbidden."
+  }
+}
+
+# Windows entrypoint scripts must expose actionable exception diagnostics.
+foreach ($entryName in @('build_windows.ps1','install_windows.ps1','doctor_windows.ps1','verify_windows.ps1','release_windows.ps1','uninstall_windows.ps1')) {
+  $entryPath = Join-Path (Join-Path $SourceRoot 'scripts') $entryName
+  $entryText = Get-Content -LiteralPath $entryPath -Raw
+  if ($entryText -notmatch '\[SUCH:FATAL\]') {
+    Fail-Audit "${entryName}: missing top-level exception diagnostics."
+  }
+}
+
 $requiredRelative = @(
   'CMakeLists.txt',
   'platform/windows/Win32Frontend.cpp',
@@ -65,7 +121,7 @@ $forbidden = @(
   @{ Text = $tests; Pattern = 'CHECK\s*\(\s*design::k'; Why = 'Compile-time design invariants must use static_assert.' },
   @{ Text = $runtime; Pattern = 'reinterpret_cast\s*<[^>]+>\s*\(\s*GetProcAddress'; Why = 'Do not directly cast FARPROC under MSVC /W4 /WX.' },
   @{ Text = $runtime; Pattern = 'reinterpret_cast\s*<\s*Fn\s*>\s*\(\s*load_symbol'; Why = 'Bind runtime symbols without C4191-prone direct function-pointer casts.' },
-  @{ Text = ($win + "`n" + $tests + "`n" + $cmake); Pattern = '\bsuch_v038\b'; Why = 'Active v1.0.0 sources must not regress target names to v0.3.8.' },
+  @{ Text = ($win + "`n" + $tests + "`n" + $cmake); Pattern = '\bsuch_v038\b'; Why = 'Active v1.1.7 sources must not regress target names to v0.3.8.' },
   @{ Text = $cmake; Pattern = 'test_v061_frontend\.cpp'; Why = 'Stale pre-split test path must not return.' }
 )
 foreach ($rule in $forbidden) {
@@ -75,7 +131,7 @@ foreach ($rule in $forbidden) {
 }
 
 if ($win -notmatch 'MoveWindow\s*\(\s*gSearch\s*,\s*searchX\s*,\s*searchY\s*,\s*searchW\s*,\s*searchH\s*,\s*TRUE\s*\)') {
-  Fail-Audit 'Expected six-argument MoveWindow(gSearch, searchX, searchY, searchW, searchH, TRUE) call not found.'
+  Fail-Audit 'Expected the search EDIT control to use inset coordinates inside the parent-owned search surface.'
 }
 if ($cmake -notmatch '/W4' -or $cmake -notmatch '/WX') {
   Fail-Audit 'MSVC strict warning policy (/W4 and /WX) is missing.'
@@ -86,8 +142,17 @@ if ($cmake -match '/wd4127') {
 if ($cmake -notmatch 'WINDOWS_EXPORT_ALL_SYMBOLS\s+ON') {
   Fail-Audit 'Windows test runtime DLL must export the ABI symbols used by GetProcAddress.'
 }
-if ($win -notmatch 'HeritageSuchV100Window') {
-  Fail-Audit 'Win32 window class has not been promoted to the v1.0 identity.'
+if ($win -notmatch 'HeritageSuchV110Window') {
+  Fail-Audit 'Win32 window class has not been promoted to the v1.1 identity.'
+}
+
+$pathsScript = Get-Content -LiteralPath (Join-Path $SourceRoot 'scripts/windows_paths.ps1') -Raw
+if (-not $pathsScript.Contains("GetFullPath('C:\Heritage\Such')")) {
+  Fail-Audit 'Windows install root must resolve to C:\Heritage\Such.'
+}
+$installScript = Get-Content -LiteralPath (Join-Path $SourceRoot 'scripts/install_windows.ps1') -Raw
+if ($installScript -match "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall") {
+  Fail-Audit 'Machine-wide install must not register uninstall state under HKCU.'
 }
 if ($win -notmatch '#include\s+<such/Version\.h>') {
   Fail-Audit 'Win32 product title/version must come from generated such/Version.h.'
@@ -96,7 +161,7 @@ if ($win -notmatch '#include\s+<such/Version\.h>') {
 # Source-boundary checks apply only to source-owned material. VCS metadata,
 # injected production runtimes, CI metadata, and build outputs are intentionally
 # outside this audit's responsibility.
-$ignoredRoots = @('.git', '.github', '.runtime', 'build', 'dist')
+$ignoredRoots = @('.git', '.github', '.runtime', '.secure', 'build', 'dist')
 $forbiddenNames = @('third_party', 'topodb', 'search.topodb')
 foreach ($entry in Get-ChildItem -LiteralPath $SourceRoot -Recurse -Force) {
   $relative = $entry.FullName.Substring($SourceRoot.Length).TrimStart([char[]]'\\/')

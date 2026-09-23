@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/bash -p
 set -euo pipefail
 
 EXE="${1:?usage: x11_smoke.sh <x11-executable>}"

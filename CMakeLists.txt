@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(Such VERSION 1.0.0 LANGUAGES CXX)
+project(Such VERSION 1.1.7 LANGUAGES CXX)
 
 
 find_package(Threads REQUIRED)
@@ -62,7 +62,9 @@ add_library(such_public_core STATIC
   src/ui/ResultView.cpp
   src/ui/FontSettings.cpp
   src/ui/AgentLauncher.cpp
-  src/runtime/RuntimeClient.cpp)
+  src/runtime/RuntimeClient.cpp
+  src/runtime/IndexPathPolicy.cpp
+  src/security/SecureSearchGate.cpp)
 add_library(Such::Public ALIAS such_public_core)
 set_target_properties(such_public_core PROPERTIES EXPORT_NAME Public)
 target_compile_features(such_public_core PUBLIC cxx_std_20)
@@ -73,7 +75,7 @@ target_include_directories(such_public_core
     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
 target_link_libraries(such_public_core PUBLIC Threads::Threads PRIVATE ${CMAKE_DL_LIBS})
 if(WIN32)
-  target_link_libraries(such_public_core PRIVATE user32)
+  target_link_libraries(such_public_core PRIVATE user32 shell32 ole32)
 endif()
 such_strict(such_public_core)
 
@@ -134,6 +136,7 @@ if(SUCH_BUILD_GUI)
 endif()
 
 if(SUCH_BUILD_TESTS)
+
   add_library(such_runtime_stub SHARED tests/fake_runtime.cpp)
   target_include_directories(such_runtime_stub PRIVATE include)
   target_compile_features(such_runtime_stub PRIVATE cxx_std_20)
@@ -150,8 +153,12 @@ if(SUCH_BUILD_TESTS)
   target_link_libraries(such_runtime_client_smoke PRIVATE Such::Public)
   such_strict(such_runtime_client_smoke)
 
+
   if(BUILD_TESTING)
-    add_test(NAME such_public_contracts COMMAND such_public_contracts)
+    add_test(NAME such_public_contracts
+      COMMAND ${CMAKE_COMMAND} -E env
+        "SUCH_TEST_POLICY_PARENT=${CMAKE_CURRENT_SOURCE_DIR}"
+        $<TARGET_FILE:such_public_contracts>)
     add_test(NAME such_runtime_client_smoke
       COMMAND ${CMAKE_COMMAND} -E env "SUCH_RUNTIME_LIBRARY=$<TARGET_FILE:such_runtime_stub>" $<TARGET_FILE:such_runtime_client_smoke>)
     if(SUCH_BUILD_CLI)
@@ -183,20 +190,6 @@ endif()
 install(TARGETS such_public_core EXPORT SuchPublicTargets ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR} LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR} INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 install(FILES "${SUCH_GENERATED_INCLUDE_DIR}/such/Version.h" DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/such")
-
-# Ship the public Apache-2.0 grant and attribution notice with every installed
-# desktop payload. Release scripts package the install staging tree, so keeping
-# this responsibility here prevents Windows/Linux/DEB packaging drift.
-install(FILES
-  "${CMAKE_CURRENT_SOURCE_DIR}/LICENSE"
-  "${CMAKE_CURRENT_SOURCE_DIR}/NOTICE"
-  DESTINATION "${CMAKE_INSTALL_DATADIR}/doc/such")
-if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/.runtime/NOTICE.txt")
-  install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/.runtime/NOTICE.txt"
-    DESTINATION "${CMAKE_INSTALL_DATADIR}/doc/such/runtime"
-    RENAME "HERITAGE_RUNTIME_NOTICE.txt")
-endif()
-
 set(_pkg "${CMAKE_INSTALL_LIBDIR}/cmake/SuchPublic")
 configure_package_config_file(cmake/SuchPublicConfig.cmake.in "${CMAKE_CURRENT_BINARY_DIR}/SuchPublicConfig.cmake" INSTALL_DESTINATION "${_pkg}")
 write_basic_package_version_file("${CMAKE_CURRENT_BINARY_DIR}/SuchPublicConfigVersion.cmake" VERSION "${PROJECT_VERSION}" COMPATIBILITY SameMajorVersion)

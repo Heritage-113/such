@@ -1,8 +1,8 @@
-# Such v1.0.0 Public Code Review
+# Such v1.1.7 Public Code Review
 
 ## Scope
 
-Review baseline: the public Such tree promoted from the v0.6.2 DriveIndexSingleScanFix line to v1.0.0.
+Review baseline: the public Such tree promoted from the v0.6.2 DriveIndexSingleScanFix line to v1.1.7.
 
 Reviewed surfaces:
 
@@ -17,7 +17,7 @@ Reviewed surfaces:
 
 The private search/storage implementation is not part of this source review. The supplied Linux production runtime is exercised as a black box by the release verification suite.
 
-## Fixed before v1.0.0
+## Fixed before v1.1.7
 
 ### Critical
 
@@ -40,7 +40,7 @@ The private search/storage implementation is not part of this source review. The
 13. **Asynchronous indexing UI refresh was incomplete.** Desktop frontends track both runtime generation and indexed-file count so results/progress can update while a crawl is still active.
 14. **Pin/index mutation failures were ignored.** Desktop frontends now report failed runtime mutations instead of silently redrawing stale state.
 15. **POSIX frontend lock fallback used a predictable shared `/tmp` file.** The fallback now creates/verifies a mode-0700 per-user directory, rejects unsafe ownership/modes, uses `O_NOFOLLOW` where available, and verifies the lock file owner/type.
-16. **Version metadata had multiple drift points.** Product version is generated from CMake (`1.0.0`), desktop titles consume the generated version header, the Windows class identity is v1, iPadOS bundle metadata remains separate, and stale v0.6.x strings are rejected by review checks.
+16. **Version metadata had multiple drift points.** Product version is generated from CMake (`1.1.7`), desktop titles consume the generated version header, the Windows class identity is v1, iPadOS bundle metadata remains separate, and stale v0.6.x strings are rejected by review checks.
 18. **Public ABI failure coverage was too narrow.** Stub regressions now cover load failure, search failure, and root-list failure in addition to the normal ABI smoke path.
 
 ## v1 search/UX contracts covered by tests
@@ -85,4 +85,4 @@ The private search/storage implementation is not part of this source review. The
 The Git-tracked public tree contains no production search/storage implementation and no private runtime binary. Windows/Linux release builders inject the approved runtime from the ignored `.runtime/` staging area, verify its pinned SHA-256, exercise the real runtime, then package it beside the executable. This separation remains an explicit v1 invariant.
 
 ## Desktop platform policy
-macOS desktop support was removed before final v1.0.0 packaging. Supported desktop targets are Windows x64 and Linux x64.
+macOS desktop support was removed before final v1.1.7 packaging. Supported desktop targets are Windows x64 and Linux x64.

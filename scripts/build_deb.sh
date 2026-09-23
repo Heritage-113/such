@@ -1,34 +1,40 @@
-#!/usr/bin/env bash
+#!/bin/bash -p
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-VERSION="${VERSION:-1.0.0}"
-ARCH="${ARCH:-amd64}"
-CONFIG="${CONFIG:-Release}"
-CONFIG_LOWER="$(printf '%s' "$CONFIG" | tr '[:upper:]' '[:lower:]')"
-INSTALL_DIR="${INSTALL_DIR:-$ROOT/dist/v1.0.0/public-linux-$CONFIG_LOWER}"
-ARTIFACT_DIR="${ARTIFACT_DIR:-$ROOT/dist/artifacts}"
-PACKAGE_ROOT="$ROOT/build/deb/such_${VERSION}_${ARCH}"
-DEB="$ARTIFACT_DIR/such_${VERSION}_${ARCH}.deb"
+SCRIPT_SOURCE="${BASH_SOURCE[0]}"
+case "$SCRIPT_SOURCE" in
+  /*) SCRIPT_SOURCE_DIR="${SCRIPT_SOURCE%/*}" ;;
+  */*) SCRIPT_SOURCE_DIR="$PWD/${SCRIPT_SOURCE%/*}" ;;
+  *) SCRIPT_SOURCE_DIR="$PWD" ;;
+esac
+SCRIPT_DIR="$(cd "$SCRIPT_SOURCE_DIR" && pwd -P)"
+unset SCRIPT_SOURCE SCRIPT_SOURCE_DIR
+# shellcheck source=linux_build_common.sh
+source "$SCRIPT_DIR/linux_build_common.sh"
+
+readonly PACKAGE_VERSION="1.1.7"
+readonly PACKAGE_ARCH="amd64"
+readonly PACKAGE_TMP="$(mktemp -d /tmp/such-deb.XXXXXX)"
+trap 'rm -rf "$PACKAGE_TMP"' EXIT
+readonly PACKAGE_ROOT="$PACKAGE_TMP/such_${PACKAGE_VERSION}_${PACKAGE_ARCH}"
+readonly DEB_FILE="$SUCH_LINUX_ARTIFACT_DIR/such_${PACKAGE_VERSION}_${PACKAGE_ARCH}.deb"
 
 case "$(uname -m)" in
   x86_64|amd64) ;;
-  *) echo "Such v1.0 Linux package is x64-only; host architecture is $(uname -m)" >&2; exit 8 ;;
+  *) printf 'Such v1.1 Linux package is x64-only; host architecture is %s\n' "$(uname -m)" >&2; exit 8 ;;
 esac
 
-command -v dpkg-deb >/dev/null || { echo "dpkg-deb not found. Install dpkg-dev/dpkg." >&2; exit 2; }
+DPKG_DEB_BIN="$(such_linux_require_tool dpkg-deb)"
 
-"$ROOT/scripts/build_linux.sh" --clean --require-runtime
+"$SUCH_LINUX_ROOT_DIR/scripts/build_linux.sh" --clean --require-runtime
 
-GUI="$INSTALL_DIR/bin/such"
-CLI="$INSTALL_DIR/bin/SuchCLI"
-RUNTIME="$INSTALL_DIR/bin/libSuchRuntimePrivate.so"
-
-for p in "$GUI" "$CLI" "$RUNTIME"; do
-  [[ -f "$p" ]] || { echo "Missing package input: $p" >&2; exit 7; }
+GUI_FILE="$SUCH_LINUX_INSTALL_DIR/bin/such"
+CLI_FILE="$SUCH_LINUX_INSTALL_DIR/bin/SuchCLI"
+RUNTIME_FILE="$SUCH_LINUX_INSTALL_DIR/bin/libSuchRuntimePrivate.so"
+for required_file in "$GUI_FILE" "$CLI_FILE" "$RUNTIME_FILE"; do
+  [[ -f "$required_file" ]] || { printf 'Missing package input: %s\n' "$required_file" >&2; exit 7; }
 done
 
-rm -rf "$PACKAGE_ROOT"
 mkdir -p \
   "$PACKAGE_ROOT/DEBIAN" \
   "$PACKAGE_ROOT/opt/such/bin" \
@@ -37,49 +43,45 @@ mkdir -p \
   "$PACKAGE_ROOT/usr/share/icons/hicolor/256x256/apps" \
   "$PACKAGE_ROOT/usr/share/doc/such/runtime"
 
-install -m 0755 "$GUI" "$PACKAGE_ROOT/opt/such/bin/such"
-install -m 0755 "$CLI" "$PACKAGE_ROOT/opt/such/bin/SuchCLI"
-install -m 0755 "$RUNTIME" "$PACKAGE_ROOT/opt/such/bin/libSuchRuntimePrivate.so"
+install -m 0755 "$GUI_FILE" "$PACKAGE_ROOT/opt/such/bin/such"
+install -m 0755 "$CLI_FILE" "$PACKAGE_ROOT/opt/such/bin/SuchCLI"
+install -m 0755 "$RUNTIME_FILE" "$PACKAGE_ROOT/opt/such/bin/libSuchRuntimePrivate.so"
 
-cat > "$PACKAGE_ROOT/usr/bin/such" <<'EOF'
-#!/usr/bin/env bash
+cat > "$PACKAGE_ROOT/usr/bin/such" <<'EOF_WRAPPER'
+#!/bin/sh
 exec /opt/such/bin/such "$@"
-EOF
-cat > "$PACKAGE_ROOT/usr/bin/SuchCLI" <<'EOF'
-#!/usr/bin/env bash
+EOF_WRAPPER
+cat > "$PACKAGE_ROOT/usr/bin/SuchCLI" <<'EOF_WRAPPER'
+#!/bin/sh
 exec /opt/such/bin/SuchCLI "$@"
-EOF
+EOF_WRAPPER
 chmod 0755 "$PACKAGE_ROOT/usr/bin/such" "$PACKAGE_ROOT/usr/bin/SuchCLI"
 
-if [[ -f "$INSTALL_DIR/share/applications/such.desktop" ]]; then
-  install -m 0644 "$INSTALL_DIR/share/applications/such.desktop" \
+if [[ -f "$SUCH_LINUX_INSTALL_DIR/share/applications/such.desktop" ]]; then
+  install -m 0644 "$SUCH_LINUX_INSTALL_DIR/share/applications/such.desktop" \
     "$PACKAGE_ROOT/usr/share/applications/such.desktop"
 fi
-if [[ -f "$INSTALL_DIR/share/icons/hicolor/256x256/apps/such.png" ]]; then
-  install -m 0644 "$INSTALL_DIR/share/icons/hicolor/256x256/apps/such.png" \
+if [[ -f "$SUCH_LINUX_INSTALL_DIR/share/icons/hicolor/256x256/apps/such.png" ]]; then
+  install -m 0644 "$SUCH_LINUX_INSTALL_DIR/share/icons/hicolor/256x256/apps/such.png" \
     "$PACKAGE_ROOT/usr/share/icons/hicolor/256x256/apps/such.png"
 fi
-
-# Copy the complete Such documentation/legal payload from CMake install staging.
-# This includes the public Apache-2.0 LICENSE and NOTICE plus the separate
-# production-runtime notice and any runtime third-party legal files.
-if [[ -d "$INSTALL_DIR/share/doc/such" ]]; then
-  cp -a "$INSTALL_DIR/share/doc/such/." "$PACKAGE_ROOT/usr/share/doc/such/"
+if [[ -d "$SUCH_LINUX_INSTALL_DIR/share/doc/such/runtime" ]]; then
+  cp -a "$SUCH_LINUX_INSTALL_DIR/share/doc/such/runtime/." "$PACKAGE_ROOT/usr/share/doc/such/runtime/"
 fi
 
-cat > "$PACKAGE_ROOT/DEBIAN/control" <<EOF
+cat > "$PACKAGE_ROOT/DEBIAN/control" <<EOF_CONTROL
 Package: such
-Version: $VERSION
+Version: $PACKAGE_VERSION
 Section: utils
 Priority: optional
-Architecture: $ARCH
+Architecture: $PACKAGE_ARCH
 Maintainer: Heritage Inc. <jimin@heritage-labs.net>
 Depends: libc6, libstdc++6, libx11-6, libpng16-16 | libpng16-16t64
 Description: Such local file search
  Native C++ local file search for Windows and Linux.
-EOF
+EOF_CONTROL
 
-cat > "$PACKAGE_ROOT/DEBIAN/postinst" <<'EOF'
+cat > "$PACKAGE_ROOT/DEBIAN/postinst" <<'EOF_MAINT'
 #!/bin/sh
 set -e
 if command -v update-desktop-database >/dev/null 2>&1; then
@@ -89,10 +91,10 @@ if command -v gtk-update-icon-cache >/dev/null 2>&1; then
     gtk-update-icon-cache -q /usr/share/icons/hicolor >/dev/null 2>&1 || true
 fi
 exit 0
-EOF
+EOF_MAINT
 chmod 0755 "$PACKAGE_ROOT/DEBIAN/postinst"
 
-cat > "$PACKAGE_ROOT/DEBIAN/postrm" <<'EOF'
+cat > "$PACKAGE_ROOT/DEBIAN/postrm" <<'EOF_MAINT'
 #!/bin/sh
 set -e
 if command -v update-desktop-database >/dev/null 2>&1; then
@@ -102,13 +104,18 @@ if command -v gtk-update-icon-cache >/dev/null 2>&1; then
     gtk-update-icon-cache -q /usr/share/icons/hicolor >/dev/null 2>&1 || true
 fi
 exit 0
-EOF
+EOF_MAINT
 chmod 0755 "$PACKAGE_ROOT/DEBIAN/postrm"
 
-find "$PACKAGE_ROOT" -type d -exec chmod 0755 {} +
-mkdir -p "$ARTIFACT_DIR"
-rm -f "$DEB"
-dpkg-deb --build --root-owner-group "$PACKAGE_ROOT" "$DEB"
+if find "$PACKAGE_ROOT" -type f \( -name '*.service' -o -path '*/etc/xdg/autostart/*' -o -path '*/systemd/system/*' -o -path '*/systemd/user/*' \) -print -quit | grep -q .; then
+  printf 'Debian package contains a forbidden resident-service/autostart payload\n' >&2
+  exit 13
+fi
 
-printf 'Debian package: %s\n' "$DEB"
-dpkg-deb --info "$DEB"
+find "$PACKAGE_ROOT" -type d -exec chmod 0755 {} +
+mkdir -p "$SUCH_LINUX_ARTIFACT_DIR"
+rm -f "$DEB_FILE"
+"$DPKG_DEB_BIN" --build --root-owner-group "$PACKAGE_ROOT" "$DEB_FILE"
+
+printf 'Debian package: %s\n' "$DEB_FILE"
+"$DPKG_DEB_BIN" --info "$DEB_FILE"

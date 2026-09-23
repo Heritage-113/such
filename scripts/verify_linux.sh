@@ -1,15 +1,44 @@
-#!/usr/bin/env bash
+#!/bin/bash -p
 set -euo pipefail
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SCRIPT_SOURCE="${BASH_SOURCE[0]}"
+case "$SCRIPT_SOURCE" in
+  /*) SCRIPT_SOURCE_DIR="${SCRIPT_SOURCE%/*}" ;;
+  */*) SCRIPT_SOURCE_DIR="$PWD/${SCRIPT_SOURCE%/*}" ;;
+  *) SCRIPT_SOURCE_DIR="$PWD" ;;
+esac
+SCRIPT_DIR="$(cd "$SCRIPT_SOURCE_DIR" && pwd -P)"
+unset SCRIPT_SOURCE SCRIPT_SOURCE_DIR
+# shellcheck source=linux_build_common.sh
+source "$SCRIPT_DIR/linux_build_common.sh"
+ROOT="$SUCH_LINUX_ROOT_DIR"
+
+assert_no_resident_exe() {
+  local exe="$1"
+  local label="$2"
+  local expected
+  expected="$(readlink -f "$exe")"
+  sleep 0.25
+  local proc target
+  for proc in /proc/[0-9]*/exe; do
+    [[ -e "$proc" ]] || continue
+    target="$(readlink -f "$proc" 2>/dev/null || true)"
+    if [[ -n "$target" && "$target" == "$expected" ]]; then
+      local pid="${proc#/proc/}"; pid="${pid%/exe}"
+      kill -TERM "$pid" 2>/dev/null || true
+      sleep 0.1
+      kill -KILL "$pid" 2>/dev/null || true
+      echo "$label left a resident Such process after GUI smoke (pid=$pid)" >&2
+      return 1
+    fi
+  done
+}
 REQUIRE_RUNTIME=0
 for arg in "$@"; do
   [[ "$arg" == "--require-runtime" ]] && REQUIRE_RUNTIME=1
 done
 "$ROOT/scripts/build_linux.sh" "$@"
-CONFIG="${CONFIG:-Release}"
-CONFIG_LOWER="$(printf '%s' "$CONFIG" | tr '[:upper:]' '[:lower:]')"
-BUILD_DIR="${BUILD_DIR:-$ROOT/build/v1.0.0/public-linux-$CONFIG_LOWER}"
-INSTALL_DIR="${INSTALL_DIR:-$ROOT/dist/v1.0.0/public-linux-$CONFIG_LOWER}"
+BUILD_DIR="$SUCH_LINUX_BUILD_DIR"
+INSTALL_DIR="$SUCH_LINUX_INSTALL_DIR"
 STUB="$BUILD_DIR/libSuchRuntimeStub.so"
 GUI="$BUILD_DIR/such"
 CLI="$BUILD_DIR/SuchCLI"
@@ -72,6 +101,7 @@ if [[ -f "$PROD" ]]; then
       echo 'Linux fresh-install GUI bootstrap failed' >&2
       exit 12
     fi
+    assert_no_resident_exe "$GUI" 'Linux fresh-install GUI' || { rm -rf "$BOOTSTRAP_TMP"; exit 12; }
     BOOTSTRAP_ROOTS="$(env HOME="$BOOTSTRAP_HOME" XDG_DATA_HOME="$BOOTSTRAP_DATA" XDG_STATE_HOME="$BOOTSTRAP_FRONTEND_STATE" XDG_RUNTIME_DIR="$BOOTSTRAP_RUN" SUCH_STATE_DIR="$BOOTSTRAP_STATE" SUCH_RUNTIME_LIBRARY="$PROD" "$CLI" '//roots')"
     if [[ "$BOOTSTRAP_ROOTS" != *"$BOOTSTRAP_HOME"* ]]; then
       cat "$BOOTSTRAP_TMP/gui.err" >&2 || true
@@ -116,6 +146,7 @@ if [[ -f "$PROD" ]]; then
       echo 'Linux stale-root recovery GUI launch failed' >&2
       exit 12
     fi
+    assert_no_resident_exe "$GUI" 'Linux stale-root recovery GUI' || { rm -rf "$STALE_TMP"; exit 12; }
     STALE_ROOTS="$(env HOME="$STALE_HOME" XDG_DATA_HOME="$STALE_DATA" XDG_STATE_HOME="$STALE_FRONTEND_STATE" XDG_RUNTIME_DIR="$STALE_RUN" SUCH_RUNTIME_LIBRARY="$PROD" "$CLI" '//roots')"
     if [[ "$STALE_ROOTS" != *"$STALE_HOME"* || "$STALE_ROOTS" == *"removed-root"* ]]; then
       cat "$STALE_TMP/gui.err" >&2 || true
@@ -161,6 +192,7 @@ if [[ -f "$PROD" ]]; then
       echo 'Linux explicit-drive preservation GUI launch failed' >&2
       exit 12
     fi
+    assert_no_resident_exe "$GUI" 'Linux explicit-drive GUI' || { rm -rf "$EXPLICIT_TMP"; exit 12; }
     EXPLICIT_ROOTS="$(env HOME="$EXPLICIT_HOME" XDG_DATA_HOME="$EXPLICIT_DATA" XDG_STATE_HOME="$EXPLICIT_FRONTEND_STATE" XDG_RUNTIME_DIR="$EXPLICIT_RUN" SUCH_RUNTIME_LIBRARY="$PROD" "$CLI" '//roots')"
     if [[ "$EXPLICIT_ROOTS" != "$EXPLICIT_ROOT" ]]; then
       printf 'Roots after explicit //drive and GUI restart were:

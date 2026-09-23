@@ -318,6 +318,13 @@ SearchFilter parse_impl(
     std::unordered_set<std::string> seen_ext;
 
     while (in >> token) {
+        // /inside is deliberately universal. It remains single-slash on Unix so
+        // content-search muscle memory is identical across frontends.
+        if (lower_ascii(token) == "/inside") {
+            out.scope = SearchScope::Content;
+            continue;
+        }
+
         // Compact all-numeric date tokens are intentionally accepted without an
         // operator prefix as well as with / or //. Their shape is unambiguous
         // enough to avoid stealing ordinary filename text.
@@ -395,15 +402,16 @@ std::vector<Suggestion> autocomplete(
     const auto last_space = query.find_last_of(" \t\n");
     const std::string_view tail = last_space == std::string_view::npos ? query : query.substr(last_space + 1);
 
-    // /claude, /codex and /; are deliberately universal UI commands. Linux and
+    // /claude, /codex, /inside and /; are deliberately universal UI commands. Linux and
     // macOS retain // for filesystem/index operators so absolute paths remain
     // unambiguous, but the AI/detail affordances follow the user's single-slash
     // muscle memory on every platform.
     if (tail.starts_with('/') && !tail.starts_with("//")) {
         std::vector<Suggestion> universal;
-        const std::array<Suggestion, 3> commands{{
+        const std::array<Suggestion, 4> commands{{
             {"/claude", "Open Claude with Such MCP"},
             {"/codex", "Open Codex with Such MCP"},
+            {"/inside", "Search inside indexed files"},
             {"/;", "Add detail-search branch"},
         }};
         const std::string typed = lower_ascii(tail);
