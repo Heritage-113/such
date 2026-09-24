@@ -1,0 +1,263 @@
+-    $versionRoot = if ($usesSourceBuildRoot) { $base } else { Join-Path $base ("v110-{0}" -f $sourceId) }
+-    $configSuffix = if ($Config -eq 'Release') { '' } else { '-' + $Config.ToLowerInvariant() }
+-    $buildDir = Join-Path $versionRoot ("windows-{0}{1}" -f $Arch.ToLowerInvariant(), $configSuffix)
+-    $installDir = Join-Path $versionRoot ("stage-windows-{0}{1}" -f $Arch.ToLowerInvariant(), $configSuffix)
+-    $consumerDir = Join-Path $versionRoot ("consumer-windows-{0}{1}" -f $Arch.ToLowerInvariant(), $configSuffix)
+-    $sourceLink = Join-Path $versionRoot 'src'
+-
+-    New-Item -ItemType Directory -Force -Path $versionRoot | Out-Null
+ 
+-    # Use the real source path unless it is long enough to risk MSBuild/FileTracker.
+-    # This removes the junction from the normal code path, which is more reliable on
+-    # locked-down Windows installations and network/external drives.
+-    $cmakeSource = $SourceRoot
+-    if ($SourceRoot.Length -ge 120) {
++    # Normal builds stay inside the repository and are version-scoped. The
++    # caller cannot redirect the workspace with an inherited environment
++    # variable. Very long source paths use a deterministic current-user short
++    # workspace under LocalApplicationData so MSBuild/FileTracker does not hit
++    # legacy path-length limits.
++    $versionRoot = Join-Path $sourceRootFull 'build\v1.1.8'
++    $cmakeSource = $sourceRootFull
++    $sourceLink = Join-Path $versionRoot 'src'
++    if ($sourceRootFull.Length -ge 120) {
++        $localData = Get-SuchWindowsKnownFolder -Name 'LocalApplicationData'
++        $versionRoot = Join-Path $localData ("Heritage\SuchBuild\v1.1.8-{0}" -f $sourceId)
++        $sourceLink = Join-Path $versionRoot 'src'
++        New-Item -ItemType Directory -Force -Path $versionRoot | Out-Null
+         try {
+             if (Test-Path -LiteralPath $sourceLink) {
+                 $item = Get-Item -LiteralPath $sourceLink -Force
+@@ -388,19 +384,28 @@ function Get-SuchWindowsWorkspace {
+                 }
+                 Remove-Item -LiteralPath $sourceLink -Force -ErrorAction Stop
+             }
+-            New-Item -ItemType Junction -Path $sourceLink -Target $SourceRoot -ErrorAction Stop | Out-Null
++            New-Item -ItemType Junction -Path $sourceLink -Target $sourceRootFull -ErrorAction Stop | Out-Null
+             $cmakeSource = $sourceLink
+         }
+         catch {
+             Write-Warning "Could not create short source junction '$sourceLink': $($_.Exception.Message)"
+             Write-Warning 'Falling back to the original source path. Extracting Such closer to the drive root is recommended.'
++            $versionRoot = Join-Path $sourceRootFull 'build\v1.1.8'
++            $sourceLink = Join-Path $versionRoot 'src'
++            $cmakeSource = $sourceRootFull
+         }
+     }
+ 
++    New-Item -ItemType Directory -Force -Path $versionRoot | Out-Null
++    $configSuffix = if ($Config -eq 'Release') { '' } else { '-' + $Config.ToLowerInvariant() }
++    $buildDir = Join-Path $versionRoot ("windows-{0}{1}" -f $Arch.ToLowerInvariant(), $configSuffix)
++    $installDir = Join-Path $versionRoot ("stage-windows-{0}{1}" -f $Arch.ToLowerInvariant(), $configSuffix)
++    $consumerDir = Join-Path $versionRoot ("consumer-windows-{0}{1}" -f $Arch.ToLowerInvariant(), $configSuffix)
++
+     return [pscustomobject]@{
+-        SourceRoot = $SourceRoot
++        SourceRoot = $sourceRootFull
+         CMakeSource = $cmakeSource
+-        Base = $base
++        Base = $versionRoot
+         VersionRoot = $versionRoot
+         BuildDir = $buildDir
+         InstallDir = $installDir
+@@ -423,7 +428,7 @@ function Get-SuchExpectedRuntimeSha256 {
+         [Parameter(Mandatory=$true)][ValidateSet('windows-x64','linux-x64')][string]$Platform,
+         [Parameter(Mandatory=$true)][string]$FileName
+     )
+-    $manifest = Join-Path $SourceRoot 'runtime\RUNTIME_SHA256_v1.1.7.txt'
++    $manifest = Join-Path $SourceRoot 'runtime\RUNTIME_SHA256_v1.1.8.txt'
+     if (-not (Test-Path -LiteralPath $manifest -PathType Leaf)) {
+         throw "Runtime SHA-256 manifest is missing: $manifest"
+     }
+diff --git a/src/cli/CliApp.cpp b/src/cli/CliApp.cpp
+index 85987a7..cf41c6f 100644
+--- a/src/cli/CliApp.cpp
++++ b/src/cli/CliApp.cpp
+@@ -161,7 +161,8 @@ int run_legacy_index_command(
+             std::printf("files=%zu\n", runtime.status().indexed_files);
+             return 0;
+         case such::ui::IndexCommandKind::Reindex:
+-            root_service.reindex_async();
++            if (!root_service.reindex_async(&runtime_error))
++                return print_runtime_error("reindex failed", runtime_error, 6);
+             runtime.wait_for_idle();
+             std::printf("files=%zu\n", runtime.status().indexed_files);
+             return 0;
+@@ -313,7 +314,8 @@ int run(int argc, char* const* argv, such::ui::PlatformDialect dialect) {
+         return 0;
+     }
+     if (is_verb(first, {"scan", "reindex"})) {
+-        root_service.reindex_async();
++        if (!root_service.reindex_async(&runtime_error))
++            return print_runtime_error("reindex failed", runtime_error, 6);
+         runtime.wait_for_idle();
+         std::printf("files=%zu\n", runtime.status().indexed_files);
+         return 0;
+diff --git a/src/cli/ProcessControl.cpp b/src/cli/ProcessControl.cpp
+index 5ccf8ae..df6693b 100644
+--- a/src/cli/ProcessControl.cpp
++++ b/src/cli/ProcessControl.cpp
+@@ -6,7 +6,10 @@
+ #include <cctype>
+ #include <cstdint>
+ #include <cstring>
++#include <filesystem>
++#include <optional>
+ #include <string>
++#include <string_view>
+ #include <thread>
+ #include <vector>
+ 
+@@ -25,7 +28,6 @@
+ #else
+ #include <cerrno>
+ #include <csignal>
+-#include <filesystem>
+ #include <fstream>
+ #include <sys/types.h>
+ #include <unistd.h>
+@@ -34,18 +36,121 @@
+ namespace such::cli {
+ namespace {
+ 
+-bool is_target_name(const std::string& name) {
+ #if defined(_WIN32)
+-    auto lower = name;
+-    std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) {
+-        return static_cast<char>(std::tolower(c));
++bool is_target_name(std::wstring_view name) noexcept {
++    static constexpr std::array<std::wstring_view, 3> targets{{
++        L"Such.exe", L"SuchCLI.exe", L"SuchMCP.exe"
++    }};
++    return std::any_of(targets.begin(), targets.end(), [&](std::wstring_view target) {
++        if (name.size() != target.size()) return false;
++        return CompareStringOrdinal(
++            name.data(), static_cast<int>(name.size()),
++            target.data(), static_cast<int>(target.size()), TRUE) == CSTR_EQUAL;
+     });
+-    return lower == "such.exe" || lower == "suchcli.exe" || lower == "suchmcp.exe";
++}
++
+ #else
++bool is_target_name(const std::string& name) {
+     return name == "such" || name == "Such" || name == "SuchCLI" || name == "SuchMCP";
++}
+ #endif
++
++#if defined(_WIN32)
++std::filesystem::path current_executable_path() {
++    std::wstring buffer(32768, L'\0');
++    const DWORD length = GetModuleFileNameW(nullptr, buffer.data(), static_cast<DWORD>(buffer.size()));
++    if (length == 0 || static_cast<std::size_t>(length) >= buffer.size()) return {};
++    buffer.resize(static_cast<std::size_t>(length));
++    return std::filesystem::path(buffer).lexically_normal();
++}
++
++std::optional<std::filesystem::path> process_executable_path(HANDLE process) {
++    std::wstring buffer(32768, L'\0');
++    DWORD length = static_cast<DWORD>(buffer.size());
++    if (QueryFullProcessImageNameW(process, 0, buffer.data(), &length) == FALSE || length == 0) {
++        return std::nullopt;
++    }
++    buffer.resize(static_cast<std::size_t>(length));
++    return std::filesystem::path(buffer).lexically_normal();
++}
++
++bool path_equal_or_within_ci(const std::filesystem::path& candidate,
++                             const std::filesystem::path& root) {
++    std::wstring candidate_text = candidate.lexically_normal().wstring();
++    std::wstring root_text = root.lexically_normal().wstring();
++    while (candidate_text.size() > 1u &&
++           (candidate_text.back() == L'\\' || candidate_text.back() == L'/')) candidate_text.pop_back();
++    while (root_text.size() > 1u &&
++           (root_text.back() == L'\\' || root_text.back() == L'/')) root_text.pop_back();
++    if (candidate_text.size() < root_text.size()) return false;
++    if (CompareStringOrdinal(candidate_text.data(), static_cast<int>(root_text.size()),
++                             root_text.data(), static_cast<int>(root_text.size()), TRUE) != CSTR_EQUAL) {
++        return false;
++    }
++    if (candidate_text.size() == root_text.size()) return true;
++    const wchar_t boundary = candidate_text[root_text.size()];
++    return boundary == L'\\' || boundary == L'/';
++}
++
++std::vector<std::filesystem::path> trusted_process_roots() {
++    std::vector<std::filesystem::path> roots;
++    const auto self_path = current_executable_path();
++    if (self_path.empty()) return roots;
++    const auto self_dir = self_path.parent_path();
++    roots.push_back(self_dir);
++    const auto leaf = self_dir.filename().wstring();
++    if (CompareStringOrdinal(leaf.data(), static_cast<int>(leaf.size()),
++                             L"cli", 3, TRUE) == CSTR_EQUAL) {
++        roots.push_back(self_dir.parent_path());
++    }
++    return roots;
+ }
+ 
++bool is_trusted_process_path(const std::filesystem::path& candidate,
++                             const std::vector<std::filesystem::path>& roots) {
++    return std::any_of(roots.begin(), roots.end(), [&](const auto& root) {
++        return path_equal_or_within_ci(candidate, root);
++    });
++}
++
++struct CloseWindowContext {
++    DWORD pid = 0;
++    bool posted = false;
++};
++
++BOOL CALLBACK close_such_window(HWND hwnd, LPARAM value) {
++    auto* context = reinterpret_cast<CloseWindowContext*>(value);
++    if (context == nullptr) return TRUE;
++    DWORD pid = 0;
++    GetWindowThreadProcessId(hwnd, &pid);
++    if (pid == context->pid) {
++        if (PostMessageW(hwnd, WM_CLOSE, 0, 0) != FALSE) context->posted = true;
++    }
++    return TRUE;
++}
++#elif !defined(__APPLE__)
++std::filesystem::path read_proc_executable(pid_t pid) {
++    const std::filesystem::path link = pid == ::getpid()
++        ? std::filesystem::path("/proc/self/exe")
++        : std::filesystem::path("/proc") / std::to_string(pid) / "exe";
++    std::array<char, 4096> buffer{};
++    const ssize_t length = ::readlink(link.c_str(), buffer.data(), buffer.size() - 1u);
++    if (length <= 0) return {};
++    buffer[static_cast<std::size_t>(length)] = '\0';
++    return std::filesystem::path(buffer.data()).lexically_normal();
++}
++
++bool path_equal_or_within(const std::filesystem::path& candidate,
++                          const std::filesystem::path& root) {
++    const auto candidate_text = candidate.lexically_normal().generic_string();
++    auto root_text = root.lexically_normal().generic_string();
++    while (root_text.size() > 1u && root_text.back() == '/') root_text.pop_back();
++    if (candidate_text == root_text) return true;
++    return candidate_text.size() > root_text.size() && candidate_text.starts_with(root_text) &&
++           candidate_text[root_text.size()] == '/';
++}
++#endif
++
+ #if !defined(_WIN32)
+ bool alive(pid_t pid) noexcept {
+     if (::kill(pid, 0) == 0) return true;
+@@ -74,39 +179,38 @@ StopResult stop_such_processes(bool force) noexcept {
+         return out;
+     }
+     PROCESSENTRY32W pe{};
+-    pe.dwSize = sizeof(pe);
++    pe.dwSize = static_cast<DWORD>(sizeof(pe));
++    const auto trusted_roots = trusted_process_roots();
++    if (trusted_roots.empty()) {
++        CloseHandle(snapshot);
++        out.error = "could not resolve the current Such executable path";
++        return out;
++    }
+     std::vector<DWORD> pids;
+     if (Process32FirstW(snapshot, &pe)) {
+         do {
+             if (pe.th32ProcessID == self) continue;
+-            char utf8[MAX_PATH * 3]{};
+-            const int n = WideCharToMultiByte(CP_UTF8, 0, pe.szExeFile, -1, utf8, static_cast<int>(sizeof(utf8)), nullptr, nullptr);
