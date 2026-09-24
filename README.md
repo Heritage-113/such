@@ -8,6 +8,22 @@ Current public source snapshot: **v1.1.7**.
 
 https://such.heritage-labs.net
 
+## v1.1.7
+
+This release tightens startup, indexing, desktop UI behavior, and release reproducibility.
+
+- Runtime startup no longer runs existing-index migration from `RuntimeClient::ensure_ready()`. Runtime load and index-policy mutation are separate paths.
+- Windows uses the native `EDIT` cue banner for the search placeholder. The previous manual placeholder repaint path is gone.
+- Root add/replace operations remain the indexing boundary. Frontends do not immediately trigger a second full reindex after a root mutation.
+- Runtime load, search, root enumeration, pin, and index-mutation failures are surfaced instead of being treated as empty or successful states.
+- Runtime discovery is restricted to the explicit `SUCH_RUNTIME_LIBRARY` override or the exact runtime beside the executable. There is no bare library-name fallback.
+- Linux startup root repair computes the final root set first and performs one replacement instead of repeated mutations.
+- Linux text input uses XIM/XIC with UTF-8 lookup when available, including UTF-8-safe deletion behavior.
+- Windows DPI/font refresh creates replacement fonts before releasing the old GDI handles used by the search control.
+- `/claude` and `/codex` do not install or upgrade the agent CLI. `SuchMCP` is built only when needed and a successful build is reused.
+- Linux release builds use a sealed repository-relative build context and ignore caller-provided compiler, build-directory, install-directory, runtime-path, and CMake override variables.
+- Such remains on-demand only. No Windows startup entry, service, scheduled task, systemd unit, or XDG autostart entry is installed.
+
 ## CLI
 
 Windows uses `SuchCLI`; Linux uses `such`.
@@ -120,8 +136,16 @@ Windows:
 ```bat
 scripts\doctor_windows.cmd
 scripts\build_windows.cmd -Clean
-scripts\verify_windows.cmd -Clean
+scripts\verify_windows.cmd -Clean -RequireRuntime
 ```
+
+The Windows verification path includes the known-hazard/static audit and the pinned runtime PE/SHA checks. Native Win32/MSVC verification still has to run on a Windows host.
+
+## Validation
+
+The v1.1.7 public line is checked with strict-warning builds, the public contract test suite, repository-layout auditing, runtime hash gates, and Linux real-runtime smoke/search tests. The current review baseline also covers load/search/root-list ABI failure paths, quoted roots, date/detail filters, CAD/BIM extension queries, fresh-home bootstrap, stale-root recovery, and explicit-drive preservation.
+
+Platform-specific gates remain separate: Windows requires the native `verify_windows.cmd` pass, and the iPadOS frontend remains a prototype surface rather than a promoted desktop-equivalent release target.
 
 ## Debian / Ubuntu package
 
@@ -133,11 +157,11 @@ On an x86_64 Debian/Ubuntu-family host with the normal build dependencies instal
 
 Release artifacts are written under `dist/artifacts/`. The DEB keeps the production runtime beside the real binaries under `/opt/such/bin`, while `/usr/bin/such` and `/usr/bin/SuchCLI` are launch wrappers. This preserves runtime discovery without requiring a global `LD_LIBRARY_PATH`.
 
-The v1.1.7 source snapshot retains the v1.1.7 build-directory, artifact-name, and runtime-hash manifest identifiers used by the current release scripts.
+The v1.1.7 source snapshot uses v1.1.7 build-directory, artifact-name, and runtime-hash manifest identifiers.
 
 ## Release runtime
 
-The public repository carries the approved desktop runtime artifacts used for compatibility builds:
+The public repository carries the approved desktop compatibility runtime artifacts used by the packaged Windows/Linux builds:
 
 ```text
 .runtime/
