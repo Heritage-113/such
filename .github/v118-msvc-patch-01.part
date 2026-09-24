@@ -1,0 +1,183 @@
+         gRuntimeIndexing = status.indexing;
+         if (!status.indexing && status.indexed_files == 0 && !status.roots.empty() && gRootService) {
+-            gRootService->reindex_async();
++            std::string reindex_error;
++            (void)gRootService->reindex_async(&reindex_error);
+         }
+     }
+ 
+diff --git a/scripts/audit_windows.ps1 b/scripts/audit_windows.ps1
+index 62808b2..b41532f 100644
+--- a/scripts/audit_windows.ps1
++++ b/scripts/audit_windows.ps1
+@@ -130,12 +130,13 @@ $tests = ((Get-ChildItem -LiteralPath (Join-Path $SourceRoot 'tests') -Filter '*
+ $forbidden = @(
+   @{ Text = $win; Pattern = '\bSIID_FAVORITES\b'; Why = 'SIID_FAVORITES is not a valid SHSTOCKICONID.' },
+   @{ Text = $win; Pattern = '\b(?:SetPointerCapture|ReleasePointerCapture)\b'; Why = 'Do not use nonexistent classic HWND pointer-capture APIs.' },
++  @{ Text = $win; Pattern = 'reinterpret_cast\s*<\s*WNDPROC\s*>\s*\(\s*SetWindowLongPtr'; Why = 'Use SetWindowSubclass instead of C4191-prone WNDPROC integer/function-pointer casts.' },
+   @{ Text = $win; Pattern = 'std::(?:max|min)\s*\(\s*(?:client|row|search|suggested)\.(?:left|right|top|bottom)'; Why = 'Normalize RECT/LONG geometry before STL min/max.' },
+   @{ Text = $tests; Pattern = '#define\s+CHECK[^\r\n]*do\s*\{'; Why = 'Avoid MSVC C4127/C2220 constant-condition CHECK macros under /WX.' },
+   @{ Text = $tests; Pattern = 'CHECK\s*\(\s*design::k'; Why = 'Compile-time design invariants must use static_assert.' },
+   @{ Text = $runtime; Pattern = 'reinterpret_cast\s*<[^>]+>\s*\(\s*GetProcAddress'; Why = 'Do not directly cast FARPROC under MSVC /W4 /WX.' },
+   @{ Text = $runtime; Pattern = 'reinterpret_cast\s*<\s*Fn\s*>\s*\(\s*load_symbol'; Why = 'Bind runtime symbols without C4191-prone direct function-pointer casts.' },
+-  @{ Text = ($win + "`n" + $tests + "`n" + $cmake); Pattern = '\bsuch_v038\b'; Why = 'Active v1.1.7 sources must not regress target names to v0.3.8.' },
++  @{ Text = ($win + "`n" + $tests + "`n" + $cmake); Pattern = '\bsuch_v038\b'; Why = 'Active v1.1.8 sources must not regress target names to v0.3.8.' },
+   @{ Text = $cmake; Pattern = 'test_v061_frontend\.cpp'; Why = 'Stale pre-split test path must not return.' }
+ )
+ foreach ($rule in $forbidden) {
+@@ -159,6 +160,9 @@ if ($cmake -notmatch 'WINDOWS_EXPORT_ALL_SYMBOLS\s+ON') {
+ if ($win -notmatch 'HeritageSuchV110Window') {
+   Fail-Audit 'Win32 window class has not been promoted to the v1.1 identity.'
+ }
++if ($win -notmatch 'SetWindowSubclass\s*\(' -or $win -notmatch 'DefSubclassProc\s*\(') {
++  Fail-Audit 'Search EDIT control must use the comctl32 subclass helper path.'
++}
+ 
+ $verifyScriptText = Get-Content -LiteralPath (Join-Path $SourceRoot 'scripts/verify_windows.ps1') -Raw
+ if ($verifyScriptText -notmatch '/inside SUCH_INSIDE_SENTINEL_918273') {
+@@ -169,6 +173,12 @@ if ($win -notmatch '/drive  Search folder') {
+ }
+ 
+ $pathsScript = Get-Content -LiteralPath (Join-Path $SourceRoot 'scripts/windows_paths.ps1') -Raw
++if ($pathsScript -match '\$env:SUCH_BUILD_ROOT') {
++  Fail-Audit 'Windows workspace selection must not depend on SUCH_BUILD_ROOT.'
++}
++if ($pathsScript -notmatch 'build\\v1\.1\.8') {
++  Fail-Audit 'Windows build workspace must be version-scoped to v1.1.8.'
++}
+ if ($pathsScript -notmatch "LocalApplicationData" -or $pathsScript -notmatch "Programs\\\\Such") {
+   Fail-Audit 'Windows install root must resolve from LocalApplicationData to Programs\Such.'
+ }
+@@ -192,11 +202,27 @@ if (-not (Test-Path -LiteralPath $rootServicePath -PathType Leaf)) {
+   Fail-Audit 'IndexRootService.cpp is required for root-policy orchestration.'
+ }
+ $rootServiceText = Get-Content -LiteralPath $rootServicePath -Raw
++$indexPathPolicyText = Get-Content -LiteralPath (Join-Path $SourceRoot 'src/runtime/IndexPathPolicy.cpp') -Raw
++$processControlText = Get-Content -LiteralPath (Join-Path $SourceRoot 'src/cli/ProcessControl.cpp') -Raw
+ if ($runtimeClientText -match 'plan_default_index_policy|recursive_directory_iterator') {
+   Fail-Audit 'RuntimeClient must remain a raw ABI adapter; root policy belongs to IndexRootService.'
+ }
+-if ($rootServiceText -notmatch 'plan_default_index_policy\(request\.path,\s*false') {
+-  Fail-Audit 'Root mutations must use bounded policy planning and must not pre-walk a drive.'
++if ($rootServiceText -notmatch 'plan_default_index_policy_set\(policy_requests,\s*false') {
++  Fail-Audit 'Root mutations must compile bounded root-set policy and must not pre-walk a drive.'
++}
++if ($rootServiceText -match 'recursive_directory_iterator') {
++  Fail-Audit 'IndexRootService must never recursively enumerate the selected storage.'
++}
++if ($indexPathPolicyText -match 'is_windows_protected_index_path\s*\(\s*path_key\s*\(') {
++  Fail-Audit 'IndexPathPolicy passes a Windows wide PathKey to a UTF-8 policy API.'
++}
++if ($processControlText -notmatch 'BOOL\s+CALLBACK\s+close_such_window') {
++  Fail-Audit 'Windows process-control EnumWindows callback must use an explicit CALLBACK thunk.'
++}
++$resetPosition=$rootServiceText.IndexOf('runtime.replace_roots({}, &mutation_error)')
++$seedPosition=$rootServiceText.IndexOf('apply_exclusions(runtime, prepared.exclusions')
++if ($resetPosition -lt 0 -or $seedPosition -lt 0 -or $seedPosition -lt $resetPosition) {
++  Fail-Audit 'Root replacement must reset runtime roots before seeding exclusions.'
+ }
+ if ($win -notmatch '#include\s+<such/Version\.h>') {
+   Fail-Audit 'Win32 product title/version must come from generated such/Version.h.'
+diff --git a/scripts/build_windows.ps1 b/scripts/build_windows.ps1
+index dc33d11..2a53780 100644
+--- a/scripts/build_windows.ps1
++++ b/scripts/build_windows.ps1
+@@ -72,8 +72,16 @@ function Invoke-SuchNative {
+   foreach($environmentKey in @($environmentVariables.Keys)) {
+     [void]$environmentVariables.Remove([string]$environmentKey)
+   }
++  $blockedEnvironmentNames=@(
++    'CC','CXX','CL','CFLAGS','CXXFLAGS','LDFLAGS',
++    'CMAKE_GENERATOR','CMAKE_GENERATOR_PLATFORM','CMAKE_GENERATOR_TOOLSET',
++    'CMAKE_TOOLCHAIN_FILE','CMAKE_PREFIX_PATH','CMAKE_BUILD_PARALLEL_LEVEL',
++    'CMAKE_INSTALL_PREFIX','VCPKG_ROOT','SUCH_BUILD_ROOT','SUCH_RUNTIME_LIBRARY',
++    'SUCH_STATE_DIR'
++  )
+   foreach($environmentItem in Get-ChildItem Env:) {
+     if($environmentItem.Name -ieq 'PATH'){continue}
++    if($blockedEnvironmentNames -contains $environmentItem.Name.ToUpperInvariant()){continue}
+     $environmentVariables[$environmentItem.Name]=[string]$environmentItem.Value
+   }
+   $environmentVariables['Path']=$pathValue
+@@ -133,7 +141,7 @@ $runtime=Resolve-SuchWindowsRuntime -SourceRoot $Root -ExplicitPath $RuntimeLibr
+ if ($null -ne $runtime) {
+   Assert-SuchWindowsRuntimeArchitecture -RuntimePath $runtime -Arch $Arch
+   if ($RequireRuntime.IsPresent) {
+-    if ($Arch -ne 'x64') { throw 'Such v1.1.7 release runtime is available for Windows x64 only.' }
++    if ($Arch -ne 'x64') { throw 'Such v1.1.8 release runtime is available for Windows x64 only.' }
+     Assert-SuchWindowsRuntimeSha256 -SourceRoot $Root -RuntimePath $runtime
+   }
+   $buildBin=Join-Path $Ws.BuildDir $Config
+diff --git a/scripts/install_user_fonts_windows.ps1 b/scripts/install_user_fonts_windows.ps1
+index 874fa1d..fce1618 100644
+--- a/scripts/install_user_fonts_windows.ps1
++++ b/scripts/install_user_fonts_windows.ps1
+@@ -201,7 +201,7 @@ try {
+   $manifest = [ordered]@{
+     schemaVersion = 1
+     product       = 'Such'
+-    version       = '1.1.7'
++    version       = '1.1.8'
+     installedAt   = (Get-Date).ToString('o')
+     entries       = @($entries)
+   }
+diff --git a/scripts/install_windows.ps1 b/scripts/install_windows.ps1
+index 71711bd..e325c16 100644
+--- a/scripts/install_windows.ps1
++++ b/scripts/install_windows.ps1
+@@ -106,11 +106,11 @@ Add-SuchWindowsCommandPath -Directory $cliCommandDir
+ $uninstallKey='HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\HeritageSuch'; New-Item -Path $uninstallKey -Force|Out-Null
+ $uninstallScript=Join-Path $installDir 'uninstall_windows.ps1'
+ $uninstallCmd='"{0}" -NoLogo -NoProfile -ExecutionPolicy Bypass -File "{1}"' -f $powerShellHostPath,$uninstallScript
+-foreach($kv in @(@('DisplayName','Such'),@('DisplayVersion','1.1.7'),@('Publisher','Heritage Inc.'),@('InstallLocation',$installDir),@('DisplayIcon',"$appExe,0"),@('UninstallString',$uninstallCmd))){New-ItemProperty -Path $uninstallKey -Name $kv[0] -Value $kv[1] -PropertyType String -Force|Out-Null}
++foreach($kv in @(@('DisplayName','Such'),@('DisplayVersion','1.1.8'),@('Publisher','Heritage Inc.'),@('InstallLocation',$installDir),@('DisplayIcon',"$appExe,0"),@('UninstallString',$uninstallCmd))){New-ItemProperty -Path $uninstallKey -Name $kv[0] -Value $kv[1] -PropertyType String -Force|Out-Null}
+ New-ItemProperty -Path $uninstallKey -Name QuietUninstallString -Value $uninstallCmd -PropertyType String -Force|Out-Null
+ New-ItemProperty -Path $uninstallKey -Name NoModify -Value 1 -PropertyType DWord -Force|Out-Null; New-ItemProperty -Path $uninstallKey -Name NoRepair -Value 1 -PropertyType DWord -Force|Out-Null
+ $fontManifest=Join-Path $installDir 'font-install-manifest.json'; $fontSources=@()
+ if(-not$SkipFonts.IsPresent){$fontSources=@(Get-AutoFontSources $Root); if($fontSources.Count -gt 0){& (Join-Path $PSScriptRoot 'install_user_fonts_windows.ps1') -Source $fontSources -ManifestPath $fontManifest}elseif($RequireFonts.IsPresent){throw 'No font bundles found.'}else{Write-Warning 'No local font bundle discovered.'}}
+ Remove-SuchWindowsLegacyArtifacts
+-Write-Host "Such v1.1.7 installed for current user: $installDir"
++Write-Host "Such v1.1.8 installed for current user: $installDir"
+ Write-Host "CLI command installed: $cliCommand (open a new terminal, then run: such)"
+diff --git a/scripts/release_windows.ps1 b/scripts/release_windows.ps1
+index 40c411d..34797cb 100644
+--- a/scripts/release_windows.ps1
++++ b/scripts/release_windows.ps1
+@@ -30,12 +30,12 @@ $Ws=Get-SuchWindowsWorkspace -SourceRoot $Root -Arch $Arch -Config $Config
+ $runtime=Join-Path $Ws.InstallDir 'bin\SuchRuntimePrivate.dll'
+ if(-not(Test-Path -LiteralPath $runtime -PathType Leaf)){throw "Release runtime missing from install staging: $runtime"}
+ $artifactDir=Join-Path $Root 'dist\artifacts'
+-$artifact=Join-Path $artifactDir 'Such_v1.1.7_Windows_x64_Public.zip'
++$artifact=Join-Path $artifactDir 'Such_v1.1.8_Windows_x64_Public.zip'
+ New-Item -ItemType Directory -Force -Path $artifactDir|Out-Null
+ Remove-Item -LiteralPath $artifact -Force -ErrorAction SilentlyContinue
+ $packRoot=Join-Path $Ws.VersionRoot 'release-pack-windows-x64'
+ Remove-Item -LiteralPath $packRoot -Recurse -Force -ErrorAction SilentlyContinue
+-$payload=Join-Path $packRoot 'Such-v1.1.7-Windows-x64'
++$payload=Join-Path $packRoot 'Such-v1.1.8-Windows-x64'
+ New-Item -ItemType Directory -Force -Path $payload|Out-Null
+ Copy-Item -Path (Join-Path $Ws.InstallDir '*') -Destination $payload -Recurse -Force
+ Compress-Archive -Path $payload -DestinationPath $artifact -CompressionLevel Optimal -Force
+diff --git a/scripts/windows_paths.ps1 b/scripts/windows_paths.ps1
+index 3b89adb..554ecbb 100644
+--- a/scripts/windows_paths.ps1
++++ b/scripts/windows_paths.ps1
+@@ -353,33 +353,29 @@ function Get-SuchWindowsWorkspace {
+         [Parameter(Mandatory=$true)][string]$Config
+     )
+ 
+-    $base = $env:SUCH_BUILD_ROOT
+-    $usesSourceBuildRoot = [string]::IsNullOrWhiteSpace($base)
+-    if ($usesSourceBuildRoot) { $base = Join-Path $SourceRoot 'build' }
+-    $base = [System.IO.Path]::GetFullPath($base)
+-
++    $sourceRootFull = [System.IO.Path]::GetFullPath($SourceRoot)
+     $sha256 = [System.Security.Cryptography.SHA256]::Create()
+     try {
+-        $sourceBytes = [System.Text.Encoding]::UTF8.GetBytes($SourceRoot.ToLowerInvariant())
++        $sourceBytes = [System.Text.Encoding]::UTF8.GetBytes($sourceRootFull.ToLowerInvariant())
+         $sourceHash = $sha256.ComputeHash($sourceBytes)
+     } finally {
+         $sha256.Dispose()
+     }
+     $sourceId = -join ($sourceHash[0..3] | ForEach-Object { $_.ToString('x2') })
