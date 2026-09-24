@@ -1,0 +1,193 @@
++        if (!apply_exclusions(impl_->runtime, prepared.exclusions, error)) return false;
++        impl_->request_maintenance();
++        return true;
++    }
++
++    // add_root preserves existing exclusion state. Compile the policy against
++    // the complete root set so a pre-existing explicit AppData root remains a
++    // global exception when a broader root is added later.
++    if (!apply_exclusions(impl_->runtime, prepared.exclusions, error)) return false;
++    if (!impl_->runtime.add_root(requested.path, error)) return false;
+     impl_->request_maintenance();
+     return true;
+ }
+@@ -166,39 +414,84 @@ bool IndexRootService::add_root(const std::filesystem::path& root, std::string*
+ bool IndexRootService::replace_roots(
+     const std::vector<std::filesystem::path>& roots,
+     std::string* error) {
+-    std::vector<std::filesystem::path> resolved_roots;
+-    resolved_roots.reserve(roots.size());
+-    for (const auto& root : roots) {
+-        ResolvedRoot resolved;
+-        if (!impl_->prepare_root(root, resolved, error)) return false;
+-        resolved_roots.push_back(std::move(resolved.path));
+-    }
+-    if (!impl_->runtime.replace_roots(resolved_roots, error)) return false;
+-    impl_->request_maintenance();
+-    return true;
++    PreparedRootSet prepared;
++    if (!impl_->prepare_requested_roots(roots, prepared, error)) return false;
++
++    std::string roots_error;
++    const auto previous_values = impl_->runtime.roots(&roots_error);
++    if (!roots_error.empty()) {
++        if (error != nullptr) *error = roots_error;
++        return false;
++    }
++    std::vector<std::filesystem::path> previous_roots;
++    previous_roots.reserve(previous_values.size());
++    for (const auto& value : previous_values) previous_roots.push_back(path_from_utf8(value));
++
++    return impl_->seed_root_set(prepared, previous_roots, error);
+ }
+ 
+ bool IndexRootService::remove_root(const std::filesystem::path& root, std::string* error) {
+-    if (!impl_->runtime.remove_root(root, error)) return false;
++    const auto requested = resolve_root_request(root);
++    const auto requested_key = comparable_path_key(requested.path);
++
++    std::vector<ResolvedRoot> current_roots;
++    if (!impl_->current_resolved_roots(current_roots, error)) return false;
++
++    std::vector<std::filesystem::path> previous_roots;
++    previous_roots.reserve(current_roots.size());
++    for (const auto& value : current_roots) previous_roots.push_back(value.path);
++
++    bool removed_explicit_appdata = false;
++    current_roots.erase(
++        std::remove_if(current_roots.begin(), current_roots.end(), [&](const auto& value) {
++            if (comparable_path_key(value.path) != requested_key) return false;
++            removed_explicit_appdata =
++                removed_explicit_appdata ||
++                value.override_mode == IndexPolicyOverride::ExplicitCurrentUserAppData;
++            return true;
++        }),
++        current_roots.end());
++
++    PreparedRootSet prepared;
++    if (!prepare_root_set(std::move(current_roots), prepared, error)) return false;
++
++    // Explicit AppData is a global exception to parent-dominant exclusions.
++    // Removing it must reseed the complete remaining root set; a raw remove_root
++    // would leave the old exception state sticky in the private runtime.
++    if (removed_explicit_appdata) {
++        return impl_->seed_root_set(prepared, previous_roots, error);
++    }
++
++    if (!impl_->runtime.remove_root(requested.path, error)) return false;
++    if (!apply_exclusions(impl_->runtime, prepared.exclusions, error)) return false;
+     impl_->request_maintenance();
+     return true;
+ }
+ 
+-void IndexRootService::reindex_async() {
++bool IndexRootService::reindex_async(std::string* error) {
+     std::string roots_error;
+     const auto root_values = impl_->runtime.roots(&roots_error);
+-    if (roots_error.empty()) {
+-        for (const auto& root_value : root_values) {
+-            const auto request = resolve_root_request(std::filesystem::path(root_value));
+-            std::string ignored_error;
+-            (void)apply_fixed_policy(impl_->runtime, request, &ignored_error);
+-        }
++    if (!roots_error.empty()) {
++        if (error != nullptr) *error = roots_error;
++        return false;
+     }
+-    impl_->runtime.reindex_async();
+-    impl_->request_maintenance();
++    if (root_values.empty()) {
++        impl_->runtime.reindex_async();
++        impl_->request_maintenance();
++        return true;
++    }
++
++    PreparedRootSet prepared;
++    if (!prepare_root_set(resolve_persisted_roots(root_values), prepared, error)) return false;
++    std::vector<std::filesystem::path> previous_roots;
++    previous_roots.reserve(root_values.size());
++    for (const auto& value : root_values) previous_roots.push_back(path_from_utf8(value));
++    return impl_->seed_root_set(prepared, previous_roots, error);
+ }
+ 
+ void IndexRootService::refresh_policy_async() {
++    // Startup remains non-destructive: tighten current policy in bounded idle
++    // batches, but do not rebuild roots or perform migration in ensure_ready().
+     impl_->request_maintenance();
+ }
+ 
+diff --git a/src/ui/AgentLauncher.cpp b/src/ui/AgentLauncher.cpp
+index 35a54fa..f5e23dc 100644
+--- a/src/ui/AgentLauncher.cpp
++++ b/src/ui/AgentLauncher.cpp
+@@ -257,7 +257,7 @@ bool launch_agent_terminal(AgentKind kind, const std::filesystem::path& working_
+     std::wstring command = L"powershell.exe -NoLogo -NoExit -ExecutionPolicy Bypass -Command \"";
+     for (const wchar_t c : body) { if (c == L'\"') command += L"`\""; else command.push_back(c); }
+     command += L"\"";
+-    STARTUPINFOW si{}; si.cb = sizeof(si);
++    STARTUPINFOW si{}; si.cb = static_cast<DWORD>(sizeof(si));
+     PROCESS_INFORMATION pi{};
+     std::vector<wchar_t> mutable_cmd(command.begin(), command.end()); mutable_cmd.push_back(L'\0');
+     const BOOL ok = CreateProcessW(nullptr, mutable_cmd.data(), nullptr, nullptr, FALSE, CREATE_NEW_CONSOLE,
+diff --git a/tests/public_contracts.cpp b/tests/public_contracts.cpp
+index 48aa007..6c7c632 100644
+--- a/tests/public_contracts.cpp
++++ b/tests/public_contracts.cpp
+@@ -107,13 +107,13 @@ int main() {
+         such::runtime::is_windows_protected_index_path("D:\\Work\\AppDataModel")) return fail(29, "Windows protected index paths");
+     if (!such::runtime::is_windows_such_install_path(
+             "C:\\Users\\alice\\AppData\\Local\\Programs\\Such\\Such.exe") ||
+-        such::runtime::is_windows_protected_index_path(
++        !such::runtime::is_windows_protected_index_path(
+             "C:\\Users\\alice\\AppData\\Local\\Programs\\Such\\Such.exe") ||
+         !such::runtime::is_windows_protected_index_path(
+             "C:\\Users\\alice\\AppData\\Local\\Programs\\OtherApp\\cache.bin") ||
+         !such::runtime::is_windows_protected_index_path(
+             "C:\\Users\\alice\\AppData\\Local\\Programs\\Such\\node_modules\\pkg")) {
+-        return fail(38, "Such per-user AppData carve-out");
++        return fail(38, "Windows AppData classification and Such install shape");
+     }
+ 
+     auto policy_parent = std::filesystem::temp_directory_path();
+@@ -154,10 +154,15 @@ int main() {
+     std::filesystem::remove_all(policy_root, policy_ec);
+ 
+ 
+-    if (such::runtime::is_windows_protected_index_path(
+-            "C:\\Users\\alice\\AppData\\Local\\Programs\\Such\\Such.exe")) {
+-        return fail(33, "per-user Such install directory must be the AppData carve-out");
+-    }
++#if defined(_WIN32)
++    const auto install_root = such::runtime::windows_such_install_root();
++    if (install_root.empty()) return fail(33, "per-user Such install root resolution");
++    const auto install_policy = such::runtime::plan_default_index_policy(install_root, false);
++    if (!install_policy.root_allowed) return fail(33, "current-user Such install directory carve-out");
++    const auto sibling_app = install_root.parent_path() / L"OtherApp";
++    const auto sibling_policy = such::runtime::plan_default_index_policy(sibling_app, false);
++    if (sibling_policy.root_allowed) return fail(33, "AppData sibling must remain protected");
++#endif
+ 
+     const auto security_layout = compute_window_layout(760.0f, 600.0f);
+     if (security_layout.security.y <= security_layout.search.y + security_layout.search.height)
+diff --git a/tests/runtime_client_smoke.cpp b/tests/runtime_client_smoke.cpp
+index cb2fe19..12b3159 100644
+--- a/tests/runtime_client_smoke.cpp
++++ b/tests/runtime_client_smoke.cpp
+@@ -22,8 +22,6 @@ int main(int argc, char** argv) {
+     }
+     if (!loaded) { std::cerr << error << '\n'; return 1; }
+     if (!runtime.available()) return 6;
+-    such::runtime::IndexRootService root_service(runtime, such::ui::PlatformDialect::UnixLike, false);
+-    if (!root_service.add_root(std::filesystem::path("/stub"), &error)) return 2;
+     if (expect_roots_failure) {
+         error.clear();
+         const auto roots = runtime.roots(&error);
+@@ -33,6 +31,8 @@ int main(int argc, char** argv) {
+         std::cout << "runtime roots-failure state PASS\n";
+         return 0;
+     }
++    such::runtime::IndexRootService root_service(runtime, such::ui::PlatformDialect::UnixLike, false);
++    if (!root_service.add_root(std::filesystem::path("/stub"), &error)) return 2;
+     if (expect_search_failure) {
+         const auto failed_rows = runtime.search("report", such::ui::PlatformDialect::UnixLike, 25);
+         if (!failed_rows.empty()) return 13;
