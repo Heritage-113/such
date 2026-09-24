@@ -1,0 +1,276 @@
++    // the profile directory at all when it cannot intersect the selected root.
+     auto profiles = known_folder(FOLDERID_UserProfiles);
+     if (profiles.empty()) profiles = std::filesystem::path(L"C:\\Users");
+-    std::error_code ec;
+-    for (std::filesystem::directory_iterator it(
+-             profiles, std::filesystem::directory_options::skip_permission_denied, ec), end;
+-         !ec && it != end; it.increment(ec)) {
+-        std::error_code type_ec;
+-        if (!it->is_directory(type_ec) || type_ec) continue;
+-        const auto profile = normalized_absolute(it->path());
+-        if (!current_profile.empty() &&
+-            path_key(profile) == path_key(normalized_absolute(current_profile))) {
+-            continue;
+-        }
+-        const auto appdata = profile / L"AppData";
+-        std::error_code exists_ec;
+-        if (std::filesystem::is_directory(appdata, exists_ec) && !exists_ec) {
+-            append_unique(out, seen, appdata);
++    const bool profiles_intersect_scope =
++        path_is_within(profiles, scope) || path_is_within(scope, profiles);
++    if (profiles_intersect_scope) {
++        std::error_code profile_ec;
++        for (std::filesystem::directory_iterator it(
++                 profiles, std::filesystem::directory_options::skip_permission_denied, profile_ec), end;
++             !profile_ec && it != end; it.increment(profile_ec)) {
++            std::error_code type_ec;
++            if (!it->is_directory(type_ec) || type_ec) continue;
++            const auto profile = normalized_absolute(it->path());
++            if (!current_profile.empty() &&
++                path_key(profile) == path_key(normalized_absolute(current_profile))) {
++                continue;
++            }
++            const auto appdata = profile / L"AppData";
++            std::error_code exists_ec;
++            if (std::filesystem::is_directory(appdata, exists_ec) && !exists_ec) {
++                append_if_inside_scope(appdata);
++            }
+         }
+     }
+     return out;
+ }
+ #endif
+ 
++#if defined(_WIN32)
++bool is_current_user_such_install_path(const std::filesystem::path& path) {
++    const auto install_root = windows_such_install_root();
++    return !install_root.empty() && path_is_within(normalized_absolute(path), install_root);
++}
++#endif
++
+ bool should_skip_fixed(const std::filesystem::path& path,
+                        const std::vector<std::filesystem::path>& fixed) {
+     return std::any_of(fixed.begin(), fixed.end(), [&](const auto& excluded) {
+@@ -324,10 +367,8 @@ bool is_windows_protected_index_path(std::string_view utf8_path) {
+     for (const auto& part : parts) {
+         if (is_default_noise_directory_name(part)) return true;
+     }
+-    if (!has_such_install_component_chain(parts)) {
+-        for (const auto& part : parts) {
+-            if (component_equal_ascii(part, "AppData")) return true;
+-        }
++    for (const auto& part : parts) {
++        if (component_equal_ascii(part, "AppData")) return true;
+     }
+ 
+     // Treat only C: as the fixed OS drive here. Redirected known folders are
+@@ -352,13 +393,13 @@ std::vector<std::filesystem::path> discover_default_noise_exclusions(
+     IndexPolicyOverride override_mode,
+     std::stop_token stop_token) {
+     std::vector<std::filesystem::path> discovered;
+-    std::unordered_set<std::string> seen;
++    std::unordered_set<PathKey> seen;
+     if (root.empty()) return discovered;
+ 
+     const auto normalized_root = normalized_absolute(root);
+     std::vector<std::filesystem::path> fixed;
+ #if defined(_WIN32)
+-    fixed = windows_fixed_exclusions();
++    fixed = windows_fixed_exclusions(normalized_root);
+     const bool explicit_appdata =
+         override_mode == IndexPolicyOverride::ExplicitCurrentUserAppData &&
+         is_current_user_manual_appdata_root(normalized_root);
+@@ -384,14 +425,15 @@ std::vector<std::filesystem::path> discover_default_noise_exclusions(
+         std::error_code dir_ec;
+         const bool directory = it->is_directory(dir_ec) && !dir_ec;
+         if (directory) {
+-            const auto name = current_path.filename().string();
++            const auto name = path_utf8(current_path.filename());
+             const bool fixed_excluded = should_skip_fixed(current_path, fixed);
+             const bool noisy = is_default_noise_directory_name(name);
+ #if defined(_WIN32)
+             const bool protected_path =
+                 !(override_mode == IndexPolicyOverride::ExplicitCurrentUserAppData &&
+                   is_current_user_manual_appdata_root(normalized_root)) &&
+-                is_windows_protected_index_path(path_key(current_path));
++                !is_current_user_such_install_path(current_path) &&
++                is_windows_protected_index_path(path_utf8(current_path));
+ #else
+             const bool protected_path = false;
+ #endif
+@@ -420,7 +462,7 @@ IndexPathPolicyPlan plan_default_index_policy(const std::filesystem::path& root,
+     }
+ 
+     const auto normalized_root = normalized_absolute(root);
+-    const auto root_name = normalized_root.filename().string();
++    const auto root_name = path_utf8(normalized_root.filename());
+     if (is_default_noise_directory_name(root_name)) {
+         plan.root_allowed = false;
+         plan.rejection_reason = "Such does not index dependency/cache directories by default: " + root_name;
+@@ -428,7 +470,7 @@ IndexPathPolicyPlan plan_default_index_policy(const std::filesystem::path& root,
+     }
+ 
+     std::vector<std::filesystem::path> fixed;
+-    std::unordered_set<std::string> seen;
++    std::unordered_set<PathKey> seen;
+ #if defined(_WIN32)
+     const bool explicit_appdata =
+         override_mode == IndexPolicyOverride::ExplicitCurrentUserAppData &&
+@@ -438,12 +480,14 @@ IndexPathPolicyPlan plan_default_index_policy(const std::filesystem::path& root,
+         plan.rejection_reason = "Explicit AppData override is valid only for the current user's AppData known folders";
+         return plan;
+     }
+-    if (!explicit_appdata && is_windows_protected_index_path(path_key(normalized_root))) {
++    const bool current_install_path = is_current_user_such_install_path(normalized_root);
++    if (!explicit_appdata && !current_install_path &&
++        is_windows_protected_index_path(path_utf8(normalized_root))) {
+         plan.root_allowed = false;
+         plan.rejection_reason = "Such does not index Windows/AppData system trees by default";
+         return plan;
+     }
+-    fixed = windows_fixed_exclusions();
++    fixed = windows_fixed_exclusions(normalized_root);
+     if (explicit_appdata) {
+         // Explicit AppData selection is authoritative for that known-folder root.
+         // Remove fixed AppData exclusions that are either ancestors or descendants
+@@ -474,4 +518,43 @@ IndexPathPolicyPlan plan_default_index_policy(const std::filesystem::path& root,
+     return plan;
+ }
+ 
++IndexPathPolicyPlan plan_default_index_policy_set(
++    const std::vector<IndexPolicyRootRequest>& roots,
++    bool discover_noise_directories) {
++    IndexPathPolicyPlan combined;
++    std::unordered_set<PathKey> seen;
++    std::vector<std::filesystem::path> explicit_appdata_roots;
++
++    for (const auto& request : roots) {
++        auto item = plan_default_index_policy(
++            request.root, discover_noise_directories, request.override_mode);
++        if (!item.root_allowed) return item;
++        for (const auto& excluded : item.exclusions) {
++            append_unique(combined.exclusions, seen, excluded);
++        }
++#if defined(_WIN32)
++        if (request.override_mode == IndexPolicyOverride::ExplicitCurrentUserAppData &&
++            is_current_user_manual_appdata_root(request.root)) {
++            explicit_appdata_roots.push_back(normalized_absolute(request.root));
++        }
++#endif
++    }
++
++#if defined(_WIN32)
++    if (!explicit_appdata_roots.empty()) {
++        combined.exclusions.erase(
++            std::remove_if(combined.exclusions.begin(), combined.exclusions.end(),
++                [&](const auto& excluded) {
++                    return std::any_of(explicit_appdata_roots.begin(), explicit_appdata_roots.end(),
++                        [&](const auto& allowed_root) {
++                            return path_is_within(excluded, allowed_root) ||
++                                   path_is_within(allowed_root, excluded);
++                        });
++                }),
++            combined.exclusions.end());
++    }
++#endif
++    return combined;
++}
++
+ } // namespace such::runtime
+diff --git a/src/runtime/IndexRootService.cpp b/src/runtime/IndexRootService.cpp
+index c63da49..af275a0 100644
+--- a/src/runtime/IndexRootService.cpp
++++ b/src/runtime/IndexRootService.cpp
+@@ -3,10 +3,18 @@
+ #include <such/runtime/IndexPathPolicy.h>
+ #include <such/runtime/RuntimeClient.h>
+ 
++#include <algorithm>
+ #include <array>
+ #include <unordered_set>
+ #include <utility>
+ 
++#if defined(_WIN32)
++#ifndef WIN32_LEAN_AND_MEAN
++#define WIN32_LEAN_AND_MEAN
++#endif
++#include <windows.h>
++#endif
++
+ namespace such::runtime {
+ namespace {
+ 
+@@ -15,6 +23,11 @@ struct ResolvedRoot {
+     IndexPolicyOverride override_mode = IndexPolicyOverride::None;
+ };
+ 
++struct PreparedRootSet {
++    std::vector<ResolvedRoot> roots;
++    std::vector<std::filesystem::path> exclusions;
++};
++
+ std::string path_to_utf8(const std::filesystem::path& file_path) {
+ #if defined(_WIN32)
+     const auto utf8_path = file_path.u8string();
+@@ -24,6 +37,53 @@ std::string path_to_utf8(const std::filesystem::path& file_path) {
+ #endif
+ }
+ 
++std::filesystem::path path_from_utf8(std::string_view utf8_path) {
++#if defined(_WIN32)
++    if (utf8_path.empty()) return {};
++    const int source_length = static_cast<int>(utf8_path.size());
++    const int wide_length = MultiByteToWideChar(
++        CP_UTF8, MB_ERR_INVALID_CHARS, utf8_path.data(), source_length, nullptr, 0);
++    if (wide_length <= 0) return {};
++    std::wstring wide_path(static_cast<std::size_t>(wide_length), L'\0');
++    if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, utf8_path.data(), source_length,
++                            wide_path.data(), wide_length) <= 0) {
++        return {};
++    }
++    return std::filesystem::path(wide_path);
++#else
++    return std::filesystem::path(utf8_path);
++#endif
++}
++
++#if defined(_WIN32)
++using ComparablePathKey = std::wstring;
++
++ComparablePathKey comparable_path_key(const std::filesystem::path& file_path) {
++    ComparablePathKey key = file_path.lexically_normal().generic_wstring();
++    while (key.size() > 1u && key.back() == L'/') key.pop_back();
++    if (key.empty()) return key;
++    const int source_length = static_cast<int>(key.size());
++    const int folded_length = LCMapStringEx(
++        LOCALE_NAME_INVARIANT, LCMAP_LOWERCASE, key.data(), source_length,
++        nullptr, 0, nullptr, nullptr, 0);
++    if (folded_length <= 0) return key;
++    ComparablePathKey folded(static_cast<std::size_t>(folded_length), L'\0');
++    if (LCMapStringEx(LOCALE_NAME_INVARIANT, LCMAP_LOWERCASE, key.data(), source_length,
++                      folded.data(), folded_length, nullptr, nullptr, 0) <= 0) {
++        return key;
++    }
++    return folded;
++}
++#else
++using ComparablePathKey = std::string;
++
++ComparablePathKey comparable_path_key(const std::filesystem::path& file_path) {
++    auto key = file_path.lexically_normal().generic_string();
++    while (key.size() > 1u && key.back() == '/') key.pop_back();
++    return key;
++}
++#endif
++
+ ResolvedRoot resolve_root_request(const std::filesystem::path& requested) {
+ #if defined(_WIN32)
+     const auto raw = path_to_utf8(requested);
+@@ -36,12 +96,44 @@ ResolvedRoot resolve_root_request(const std::filesystem::path& requested) {
+     return {requested, IndexPolicyOverride::None};
+ }
+ 
+-bool apply_fixed_policy(RuntimeClient& runtime,
+-                        const ResolvedRoot& request,
+-                        std::string* error) {
+-    // Responsiveness invariant: root selection never recursively enumerates the
