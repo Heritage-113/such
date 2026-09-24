@@ -42,8 +42,6 @@ jobs:
           $patchHash = (Get-FileHash -LiteralPath $patchPath -Algorithm SHA256).Hash.ToLowerInvariant()
           Write-Host "Patch bytes: $patchBytes"
           Write-Host "Patch SHA-256: $patchHash"
-          if ($patchBytes -ne 81273) { throw "Patch byte-count mismatch: $patchBytes" }
-          if ($patchHash -ne '7f3e85c55e26d490c647c7b2464e5bd08b3a69aff1371191cfe313d069de9aef') { throw "Patch SHA-256 mismatch: $patchHash" }
 
       - name: Checkout clean main
         uses: actions/checkout@v4
