@@ -1,0 +1,260 @@
+-            if (n > 0 && is_target_name(utf8)) pids.push_back(pe.th32ProcessID);
++            if (!is_target_name(pe.szExeFile)) continue;
++            HANDLE candidate_process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pe.th32ProcessID);
++            if (candidate_process == nullptr) continue;
++            const auto candidate_path = process_executable_path(candidate_process);
++            CloseHandle(candidate_process);
++            if (candidate_path.has_value() && is_trusted_process_path(*candidate_path, trusted_roots)) {
++                pids.push_back(pe.th32ProcessID);
++            }
+         } while (Process32NextW(snapshot, &pe));
+     }
+     CloseHandle(snapshot);
+     out.matched = pids.size();
+ 
+-    struct CloseCtx { DWORD pid; bool posted; };
+-    auto close_windows = [](HWND hwnd, LPARAM value) -> BOOL {
+-        auto* ctx = reinterpret_cast<CloseCtx*>(value);
+-        DWORD pid = 0;
+-        GetWindowThreadProcessId(hwnd, &pid);
+-        if (pid == ctx->pid) {
+-            PostMessageW(hwnd, WM_CLOSE, 0, 0);
+-            ctx->posted = true;
+-        }
+-        return TRUE;
+-    };
+-
+     for (const DWORD pid : pids) {
+         HANDLE process = OpenProcess(SYNCHRONIZE | PROCESS_TERMINATE, FALSE, pid);
+         if (!process) { ++out.failed; continue; }
+         bool terminated = false;
+         if (!force) {
+-            CloseCtx ctx{pid, false};
+-            EnumWindows(close_windows, reinterpret_cast<LPARAM>(&ctx));
+-            if (ctx.posted && WaitForSingleObject(process, 1500) == WAIT_OBJECT_0) terminated = true;
++            CloseWindowContext context{pid, false};
++            EnumWindows(close_such_window, reinterpret_cast<LPARAM>(&context));
++            if (context.posted && WaitForSingleObject(process, 1500) == WAIT_OBJECT_0) terminated = true;
+         }
+         if (!terminated) {
+             if (TerminateProcess(process, 0)) {
+@@ -140,6 +244,12 @@ StopResult stop_such_processes(bool force) noexcept {
+     }
+ #else
+     const pid_t self = ::getpid();
++    const auto self_executable = read_proc_executable(self);
++    if (self_executable.empty()) {
++        out.error = "could not resolve the current Such executable path";
++        return out;
++    }
++    const auto trusted_root = self_executable.parent_path();
+     std::error_code ec;
+     for (const auto& entry : std::filesystem::directory_iterator("/proc", ec)) {
+         if (ec || !entry.is_directory(ec)) continue;
+@@ -152,6 +262,8 @@ StopResult stop_such_processes(bool force) noexcept {
+         std::string name;
+         std::getline(comm, name);
+         if (!is_target_name(name)) continue;
++        const auto candidate_executable = read_proc_executable(pid);
++        if (candidate_executable.empty() || !path_equal_or_within(candidate_executable, trusted_root)) continue;
+         ++out.matched;
+         const int signal = force ? SIGKILL : SIGTERM;
+         if (::kill(pid, signal) != 0) { ++out.failed; continue; }
+diff --git a/src/runtime/IndexPathPolicy.cpp b/src/runtime/IndexPathPolicy.cpp
+index e5e192f..f2b6331 100644
+--- a/src/runtime/IndexPathPolicy.cpp
++++ b/src/runtime/IndexPathPolicy.cpp
+@@ -19,28 +19,57 @@ namespace such::runtime {
+ namespace {
+ 
+ #if defined(_WIN32)
+-std::string lower_ascii(std::string value) {
+-    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
+-        return static_cast<char>(std::tolower(c));
+-    });
+-    return value;
++using PathKey = std::wstring;
++
++PathKey path_key(const std::filesystem::path& path) {
++    PathKey text = path.lexically_normal().generic_wstring();
++    while (text.size() > 1u && text.back() == L'/') text.pop_back();
++    if (text.empty()) return text;
++
++    // Windows paths are case-insensitive. Fold with the invariant Windows
++    // Unicode mapper instead of lowercasing UTF-8 bytes as ASCII; the latter
++    // incorrectly treated case variants of non-ASCII user/profile names as
++    // distinct roots.
++    const int source_length = static_cast<int>(text.size());
++    const int folded_length = LCMapStringEx(
++        LOCALE_NAME_INVARIANT, LCMAP_LOWERCASE, text.data(), source_length,
++        nullptr, 0, nullptr, nullptr, 0);
++    if (folded_length <= 0) return text;
++    PathKey folded(static_cast<std::size_t>(folded_length), L'\0');
++    if (LCMapStringEx(LOCALE_NAME_INVARIANT, LCMAP_LOWERCASE, text.data(), source_length,
++                      folded.data(), folded_length, nullptr, nullptr, 0) <= 0) {
++        return text;
++    }
++    return folded;
++}
++#else
++using PathKey = std::string;
++
++PathKey path_key(const std::filesystem::path& path) {
++    PathKey text = path.lexically_normal().generic_string();
++    while (text.size() > 1u && text.back() == '/') text.pop_back();
++    return text;
+ }
+ #endif
+ 
+-std::string path_key(const std::filesystem::path& path) {
+-    auto text = path.lexically_normal().generic_string();
++std::string path_utf8(const std::filesystem::path& path) {
+ #if defined(_WIN32)
+-    text = lower_ascii(std::move(text));
++    const auto utf8 = path.u8string();
++    return std::string(reinterpret_cast<const char*>(utf8.data()), utf8.size());
++#else
++    return path.string();
+ #endif
+-    while (text.size() > 1u && text.back() == '/') text.pop_back();
+-    return text;
+ }
+ 
+-bool key_is_within(std::string_view candidate, std::string_view parent) {
++bool key_is_within(const PathKey& candidate, const PathKey& parent) {
+     if (candidate == parent) return true;
+     if (parent.empty() || candidate.size() <= parent.size()) return false;
+     if (!candidate.starts_with(parent)) return false;
++#if defined(_WIN32)
++    return parent.back() == L'/' || candidate[parent.size()] == L'/';
++#else
+     return parent.back() == '/' || candidate[parent.size()] == '/';
++#endif
+ }
+ 
+ bool path_is_within(const std::filesystem::path& candidate, const std::filesystem::path& parent) {
+@@ -55,7 +84,7 @@ std::filesystem::path normalized_absolute(const std::filesystem::path& input) {
+ }
+ 
+ void append_unique(std::vector<std::filesystem::path>& out,
+-                   std::unordered_set<std::string>& seen,
++                   std::unordered_set<PathKey>& seen,
+                    const std::filesystem::path& value) {
+     const auto normalized = normalized_absolute(value);
+     const auto key = path_key(normalized);
+@@ -104,15 +133,16 @@ bool has_such_install_component_chain(const std::vector<std::string>& parts) {
+ #if defined(_WIN32)
+ std::filesystem::path known_folder(REFKNOWNFOLDERID id) {
+     PWSTR value = nullptr;
+-    if (SHGetKnownFolderPath(id, KF_FLAG_DEFAULT, nullptr, &value) != S_OK || value == nullptr) return {};
++    const HRESULT result = SHGetKnownFolderPath(id, KF_FLAG_DEFAULT, nullptr, &value);
++    if (FAILED(result) || value == nullptr) return {};
+     std::filesystem::path out(value);
+     CoTaskMemFree(value);
+     return out;
+ }
+ 
+-void append_directory_children_except(
++void append_children_except(
+     std::vector<std::filesystem::path>& out,
+-    std::unordered_set<std::string>& seen,
++    std::unordered_set<PathKey>& seen,
+     const std::filesystem::path& parent,
+     const std::filesystem::path& allowed_child) {
+     std::error_code ec;
+@@ -120,30 +150,33 @@ void append_directory_children_except(
+     for (std::filesystem::directory_iterator it(
+              parent, std::filesystem::directory_options::skip_permission_denied, ec), end;
+          !ec && it != end; it.increment(ec)) {
+-        std::error_code type_ec;
+-        if (!it->is_directory(type_ec) || type_ec) continue;
+         const auto candidate = normalized_absolute(it->path());
+         if (path_key(candidate) == allowed_key) continue;
+         append_unique(out, seen, candidate);
+     }
+ }
+ 
+-std::vector<std::filesystem::path> windows_fixed_exclusions() {
++std::vector<std::filesystem::path> windows_fixed_exclusions(
++    const std::filesystem::path& scope_root) {
+     std::vector<std::filesystem::path> out;
+-    std::unordered_set<std::string> seen;
++    std::unordered_set<PathKey> seen;
++    const auto scope = normalized_absolute(scope_root);
++
++    auto append_if_inside_scope = [&](const std::filesystem::path& candidate) {
++        if (!candidate.empty() && path_is_within(normalized_absolute(candidate), scope)) {
++            append_unique(out, seen, candidate);
++        }
++    };
+ 
+-    // System/application roots remain hard exclusions. AppData is handled
+-    // separately below because the current user's Such install directory is a
+-    // deliberate carve-out under LocalAppData.
++    // System/application roots remain hard exclusions, but only material that
++    // can actually occur below this selected root is planned. In particular,
++    // choosing a D:/ or project root must not synchronously enumerate C:/Users.
+     const std::array<KNOWNFOLDERID, 3> known{{
+         FOLDERID_ProgramData,
+         FOLDERID_ProgramFiles,
+         FOLDERID_ProgramFilesX86,
+     }};
+-    for (const auto& id : known) {
+-        const auto fixed_path = known_folder(id);
+-        if (!fixed_path.empty()) append_unique(out, seen, fixed_path);
+-    }
++    for (const auto& id : known) append_if_inside_scope(known_folder(id));
+ 
+     const std::array<std::wstring_view, 13> c_drive{{
+         L"C:\\Windows",
+@@ -160,7 +193,7 @@ std::vector<std::filesystem::path> windows_fixed_exclusions() {
+         L"C:\\$Windows.~BT",
+         L"C:\\$Windows.~WS",
+     }};
+-    for (const auto value : c_drive) append_unique(out, seen, std::filesystem::path(value));
++    for (const auto value : c_drive) append_if_inside_scope(std::filesystem::path(value));
+ 
+     const auto current_profile = known_folder(FOLDERID_Profile);
+     const auto roaming_appdata = known_folder(FOLDERID_RoamingAppData);
+@@ -170,50 +203,60 @@ std::vector<std::filesystem::path> windows_fixed_exclusions() {
+         ? std::filesystem::path{}
+         : normalized_absolute(local_appdata / L"Programs" / L"Such");
+ 
+-    if (!roaming_appdata.empty()) append_unique(out, seen, roaming_appdata);
+-    if (!local_low_appdata.empty()) append_unique(out, seen, local_low_appdata);
+-
+-    std::error_code install_ec;
+-    const bool installed_here =
+-        !install_root.empty() && std::filesystem::is_directory(install_root, install_ec) && !install_ec;
+-    if (!local_appdata.empty()) {
+-        if (!installed_here) {
+-            append_unique(out, seen, local_appdata);
+-        } else {
+-            const auto programs = normalized_absolute(local_appdata / L"Programs");
+-            append_directory_children_except(out, seen, local_appdata, programs);
+-            std::error_code programs_ec;
+-            if (std::filesystem::is_directory(programs, programs_ec) && !programs_ec) {
+-                append_directory_children_except(out, seen, programs, install_root);
+-            }
++    append_if_inside_scope(roaming_appdata);
++    append_if_inside_scope(local_low_appdata);
++
++    // LocalAppData cannot be excluded as one parent because the private ABI's
++    // exclusion state is parent-dominant: a later set_indexed(child, true) does
++    // not reopen a child of an excluded parent. Therefore, only when the chosen
++    // root contains LocalAppData, seed its immediate siblings while preserving
++    // Programs/Such. This is bounded one-level enumeration, never a selected-
++    // drive recursive walk.
++    if (!local_appdata.empty() && path_is_within(local_appdata, scope)) {
++        const auto programs = normalized_absolute(local_appdata / L"Programs");
++        append_children_except(out, seen, local_appdata, programs);
++        std::error_code programs_ec;
++        if (std::filesystem::is_directory(programs, programs_ec) && !programs_ec) {
++            append_children_except(out, seen, programs, install_root);
+         }
+     }
+ 
+-    // Other local profiles keep their complete AppData exclusion. The current
+-    // profile is handled by the carve-out logic above.
++    // Other profiles' complete AppData trees remain excluded. Avoid touching
++    // the profile directory at all when it cannot intersect the selected root.
