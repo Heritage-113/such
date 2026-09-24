@@ -1,0 +1,90 @@
+name: Such v1.1.8 MSVC verification
+
+on:
+  push:
+    branches:
+      - automation/v1.1.8-msvc-verify
+    paths:
+      - '.github/v118-msvc-run'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-msvc:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout verification transport
+        uses: actions/checkout@v4
+        with:
+          ref: automation/v1.1.8-msvc-verify
+          fetch-depth: 1
+
+      - name: Assemble plain-text patch
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $parts = Get-ChildItem -LiteralPath '.github' -Filter 'v118-msvc-patch-*.part' -File | Sort-Object Name
+          if ($parts.Count -ne 7) { throw "Expected 7 patch parts, found $($parts.Count)." }
+          $patchPath = Join-Path $env:RUNNER_TEMP 'such-v1.1.8-msvc.patch'
+          $writer = New-Object System.IO.StreamWriter($patchPath, $false, (New-Object System.Text.UTF8Encoding($false)))
+          try {
+            foreach ($part in $parts) {
+              $text = [System.IO.File]::ReadAllText($part.FullName)
+              $writer.Write($text)
+            }
+          } finally {
+            $writer.Dispose()
+          }
+          Write-Host "Patch bytes: $((Get-Item -LiteralPath $patchPath).Length)"
+
+      - name: Checkout clean main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 1
+          clean: true
+
+      - name: Apply v1.1.8 patch
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $patchPath = Join-Path $env:RUNNER_TEMP 'such-v1.1.8-msvc.patch'
+          git apply --check --whitespace=error-all $patchPath
+          if ($LASTEXITCODE -ne 0) { throw 'git apply --check failed' }
+          git apply --whitespace=error-all $patchPath
+          if ($LASTEXITCODE -ne 0) { throw 'git apply failed' }
+          git diff --check
+          if ($LASTEXITCODE -ne 0) { throw 'git diff --check failed' }
+          git diff --stat
+
+      - name: Windows PowerShell 5.1 source audit
+        shell: cmd
+        run: powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File scripts\audit_windows.ps1
+
+      - name: Windows PowerShell 5.1 VS2022 build and CTest
+        shell: cmd
+        run: powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File scripts\build_windows.ps1 -Config Release -Arch x64 -Generator "Visual Studio 17 2022" -Jobs 2 -Clean
+
+      - name: Current-user install smoke without elevation
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File scripts\install_windows.ps1 -Config Release -Arch x64 -Generator 'Visual Studio 17 2022' -Jobs 2 -SkipBuild -SkipFonts
+          if ($LASTEXITCODE -ne 0) { throw "install_windows.ps1 failed with exit $LASTEXITCODE" }
+          $installRoot = Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)) 'Programs\Such'
+          $exe = Join-Path $installRoot 'SuchCLI.exe'
+          if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) { throw "Per-user CLI missing: $exe" }
+          $version = (& $exe version | Out-String).Trim()
+          if ($version -ne '1.1.8') { throw "Installed version mismatch: $version" }
+          if (-not (Test-Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\HeritageSuch')) { throw 'HKCU uninstall registration missing' }
+          if (Test-Path 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\HeritageSuch') { Write-Host 'Existing machine-wide legacy registration detected; v1.1.8 did not create it.' }
+          Write-Host "Per-user install PASS: $installRoot"
+
+      - name: Show final source state
+        shell: powershell
+        run: |
+          git status --short
+          git diff --check
