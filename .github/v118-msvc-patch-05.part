@@ -1,0 +1,267 @@
+-    // selected storage on the caller thread. The private runtime owns crawling.
+-    const auto plan = plan_default_index_policy(request.path, false, request.override_mode);
++ResolvedRoot resolve_persisted_root(const std::filesystem::path& persisted) {
++#if defined(_WIN32)
++    // Exact AppData roots can only be admitted through an explicit user override.
++    // Reconstruct that intent after restart so maintenance cannot hide a root
++    // that Such itself previously accepted.
++    if (is_current_user_manual_appdata_root(persisted)) {
++        return {persisted, IndexPolicyOverride::ExplicitCurrentUserAppData};
++    }
++#endif
++    return {persisted, IndexPolicyOverride::None};
++}
++
++bool prepare_root_set(std::vector<ResolvedRoot> resolved_roots,
++                      PreparedRootSet& prepared,
++                      std::string* error) {
++    std::vector<ResolvedRoot> unique_roots;
++    unique_roots.reserve(resolved_roots.size());
++    for (auto& root : resolved_roots) {
++        const auto key = comparable_path_key(root.path);
++        const auto existing = std::find_if(unique_roots.begin(), unique_roots.end(), [&](const auto& value) {
++            return comparable_path_key(value.path) == key;
++        });
++        if (existing == unique_roots.end()) {
++            unique_roots.push_back(std::move(root));
++        } else if (root.override_mode == IndexPolicyOverride::ExplicitCurrentUserAppData) {
++            existing->override_mode = root.override_mode;
++        }
++    }
++
++    std::vector<IndexPolicyRootRequest> policy_requests;
++    policy_requests.reserve(unique_roots.size());
++    for (const auto& root : unique_roots) {
++        policy_requests.push_back({root.path, root.override_mode});
++    }
++
++    // Responsiveness invariant: product root changes use bounded planning only.
++    // No recursive traversal of the selected storage happens here.
++    auto plan = plan_default_index_policy_set(policy_requests, false);
+     if (!plan.root_allowed) {
+         if (error != nullptr) {
+             *error = plan.rejection_reason.empty()
+@@ -51,7 +143,15 @@ bool apply_fixed_policy(RuntimeClient& runtime,
+         return false;
+     }
+ 
+-    for (const auto& excluded_path : plan.exclusions) {
++    prepared.roots = std::move(unique_roots);
++    prepared.exclusions = std::move(plan.exclusions);
++    return true;
++}
++
++bool apply_exclusions(RuntimeClient& runtime,
++                      const std::vector<std::filesystem::path>& exclusions,
++                      std::string* error) {
++    for (const auto& excluded_path : exclusions) {
+         const auto excluded_utf8 = path_to_utf8(excluded_path);
+         std::string mutation_error;
+         if (!runtime.set_indexed(excluded_utf8, false, &mutation_error)) {
+@@ -66,6 +166,17 @@ bool apply_fixed_policy(RuntimeClient& runtime,
+     return true;
+ }
+ 
++std::vector<ResolvedRoot> resolve_persisted_roots(const std::vector<std::string>& root_values) {
++    std::vector<ResolvedRoot> resolved;
++    resolved.reserve(root_values.size());
++    for (const auto& root_value : root_values) {
++        const auto root_path = path_from_utf8(root_value);
++        if (!root_value.empty() && root_path.empty()) continue;
++        resolved.push_back(resolve_persisted_root(root_path));
++    }
++    return resolved;
++}
++
+ } // namespace
+ 
+ struct IndexRootService::Impl {
+@@ -73,7 +184,10 @@ struct IndexRootService::Impl {
+     such::ui::PlatformDialect dialect;
+     bool maintenance_enabled = true;
+     bool maintenance_pending = false;
++    bool maintenance_fixed_ready = false;
++    std::size_t maintenance_fixed_index = 0;
+     std::size_t noise_term_index = 0;
++    std::vector<std::filesystem::path> maintenance_fixed_exclusions;
+     std::array<std::unordered_set<std::string>, 3> maintenance_seen_prefixes;
+ 
+     explicit Impl(RuntimeClient& runtime_value,
+@@ -83,20 +197,108 @@ struct IndexRootService::Impl {
+           dialect(dialect_value),
+           maintenance_enabled(enable_maintenance) {}
+ 
+-    bool prepare_root(const std::filesystem::path& requested,
+-                      ResolvedRoot& resolved,
+-                      std::string* error) {
+-        resolved = resolve_root_request(requested);
+-        return apply_fixed_policy(runtime, resolved, error);
++    bool current_resolved_roots(std::vector<ResolvedRoot>& resolved, std::string* error) {
++        std::string roots_error;
++        const auto root_values = runtime.roots(&roots_error);
++        if (!roots_error.empty()) {
++            if (error != nullptr) *error = roots_error;
++            return false;
++        }
++        resolved = resolve_persisted_roots(root_values);
++        return true;
++    }
++
++    bool prepare_requested_roots(const std::vector<std::filesystem::path>& requested,
++                                 PreparedRootSet& prepared,
++                                 std::string* error) {
++        std::vector<ResolvedRoot> resolved;
++        resolved.reserve(requested.size());
++        for (const auto& root : requested) resolved.push_back(resolve_root_request(root));
++        return prepare_root_set(std::move(resolved), prepared, error);
++    }
++
++    bool apply_prepared_root_set(const PreparedRootSet& prepared, std::string* error) {
++        // Runtime semantics are parent-dominant and replace_roots() clears the
++        // per-path exclusion table. Therefore the only safe full replacement is
++        // reset -> seed exclusions -> add roots. add_root() preserves exclusions
++        // while it schedules the private asynchronous crawl.
++        std::string mutation_error;
++        if (!runtime.replace_roots({}, &mutation_error)) {
++            if (error != nullptr) *error = mutation_error;
++            return false;
++        }
++        if (!apply_exclusions(runtime, prepared.exclusions, &mutation_error)) {
++            if (error != nullptr) *error = mutation_error;
++            return false;
++        }
++        for (const auto& root : prepared.roots) {
++            if (!runtime.add_root(root.path, &mutation_error)) {
++                if (error != nullptr) *error = mutation_error;
++                return false;
++            }
++        }
++        return true;
++    }
++
++    bool rollback_roots(const std::vector<std::filesystem::path>& previous_roots,
++                        const std::string& primary_error,
++                        std::string* error) {
++        std::vector<ResolvedRoot> previous_resolved;
++        previous_resolved.reserve(previous_roots.size());
++        for (const auto& previous_root : previous_roots) {
++            previous_resolved.push_back(resolve_persisted_root(previous_root));
++        }
++
++        PreparedRootSet previous_prepared;
++        std::string rollback_error;
++        bool restored = prepare_root_set(std::move(previous_resolved), previous_prepared, &rollback_error);
++        if (restored) restored = apply_prepared_root_set(previous_prepared, &rollback_error);
++
++        if (error != nullptr) {
++            *error = primary_error.empty() ? "Search-root mutation failed" : primary_error;
++            if (!restored) {
++                *error += "; policy-preserving rollback failed";
++                if (!rollback_error.empty()) *error += ": " + rollback_error;
++            }
++        }
++        request_maintenance();
++        return false;
++    }
++
++    bool seed_root_set(const PreparedRootSet& prepared,
++                       const std::vector<std::filesystem::path>& previous_roots,
++                       std::string* error) {
++        std::string mutation_error;
++        if (!apply_prepared_root_set(prepared, &mutation_error)) {
++            return rollback_roots(previous_roots, mutation_error, error);
++        }
++        request_maintenance();
++        return true;
+     }
+ 
+     void request_maintenance() noexcept {
+         if (!maintenance_enabled) return;
+         maintenance_pending = true;
++        maintenance_fixed_ready = false;
++        maintenance_fixed_index = 0;
++        maintenance_fixed_exclusions.clear();
+         noise_term_index = 0;
+         for (auto& seen_prefixes : maintenance_seen_prefixes) seen_prefixes.clear();
+     }
+ 
++    bool prepare_fixed_maintenance() {
++        std::string roots_error;
++        const auto root_values = runtime.roots(&roots_error);
++        if (!roots_error.empty()) return false;
++
++        PreparedRootSet prepared;
++        if (!prepare_root_set(resolve_persisted_roots(root_values), prepared, nullptr)) return false;
++        maintenance_fixed_exclusions = std::move(prepared.exclusions);
++        maintenance_fixed_index = 0;
++        maintenance_fixed_ready = true;
++        return true;
++    }
++
+     void scrub_one_batch() {
+         if (!maintenance_pending || !maintenance_enabled) return;
+         const auto runtime_status = runtime.status();
+@@ -106,6 +308,22 @@ struct IndexRootService::Impl {
+             "node_modules", ".git", "__pycache__"
+         }};
+         static constexpr std::size_t maintenance_mutation_limit = 16u;
++
++        if (!maintenance_fixed_ready && !prepare_fixed_maintenance()) {
++            maintenance_pending = false;
++            return;
++        }
++
++        std::size_t fixed_applied = 0;
++        while (maintenance_fixed_index < maintenance_fixed_exclusions.size() &&
++               fixed_applied < maintenance_mutation_limit) {
++            const auto& excluded = maintenance_fixed_exclusions[maintenance_fixed_index++];
++            std::string ignored_error;
++            (void)runtime.set_indexed(path_to_utf8(excluded), false, &ignored_error);
++            ++fixed_applied;
++        }
++        if (maintenance_fixed_index < maintenance_fixed_exclusions.size()) return;
++
+         if (noise_term_index >= noise_terms.size()) {
+             maintenance_pending = false;
+             return;
+@@ -140,8 +358,7 @@ struct IndexRootService::Impl {
+         // Keep the same term only while the bounded query produces a prefix we
+         // have not already handled. Some runtimes may continue returning rows
+         // below a just-excluded subtree until their index view catches up; the
+-        // seen-prefix set guarantees this maintenance state machine still makes
+-        // forward progress instead of looping forever on the same 512 rows.
++        // seen-prefix set guarantees forward progress.
+         if (rows.empty() || applied == 0u) ++noise_term_index;
+         if (noise_term_index >= noise_terms.size()) maintenance_pending = false;
+     }
+@@ -156,9 +373,40 @@ IndexRootService::IndexRootService(
+ IndexRootService::~IndexRootService() = default;
+ 
+ bool IndexRootService::add_root(const std::filesystem::path& root, std::string* error) {
+-    ResolvedRoot resolved;
+-    if (!impl_->prepare_root(root, resolved, error)) return false;
+-    if (!impl_->runtime.add_root(resolved.path, error)) return false;
++    std::vector<ResolvedRoot> current_roots;
++    if (!impl_->current_resolved_roots(current_roots, error)) return false;
++
++    std::vector<std::filesystem::path> previous_roots;
++    previous_roots.reserve(current_roots.size());
++    for (const auto& value : current_roots) previous_roots.push_back(value.path);
++
++    const auto requested = resolve_root_request(root);
++    const auto requested_key = comparable_path_key(requested.path);
++    const bool already_present = std::any_of(current_roots.begin(), current_roots.end(), [&](const auto& value) {
++        return comparable_path_key(value.path) == requested_key;
++    });
++    current_roots.push_back(requested);
++    PreparedRootSet prepared;
++    if (!prepare_root_set(current_roots, prepared, error)) return false;
++
++    // An explicit AppData add is an exception to an otherwise sticky parent
++    // exclusion. Re-seed the full root set even if that root already exists so
++    // stale parent exclusions are actually cleared.
++    if (requested.override_mode == IndexPolicyOverride::ExplicitCurrentUserAppData) {
++        return impl_->seed_root_set(prepared, previous_roots, error);
++    }
++
++    if (already_present) {
