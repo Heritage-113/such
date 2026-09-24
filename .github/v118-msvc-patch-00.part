@@ -1,0 +1,241 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 747570c..e540ac0 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -1,5 +1,5 @@
+ cmake_minimum_required(VERSION 3.20)
+-project(Such VERSION 1.1.7 LANGUAGES CXX)
++project(Such VERSION 1.1.8 LANGUAGES CXX)
+ 
+ 
+ find_package(Threads REQUIRED)
+@@ -27,11 +27,14 @@ if(APPLE AND CMAKE_SYSTEM_NAME STREQUAL "iOS")
+ endif()
+ if(WIN32)
+   enable_language(RC)
++  if(NOT MSVC)
++    message(FATAL_ERROR "Such Windows builds require the MSVC toolchain. Use a Visual Studio generator without a Clang/MinGW toolset override.")
++  endif()
+ endif()
+ 
+ function(such_strict target)
+   if(MSVC)
+-    target_compile_options(${target} PRIVATE /W4 /permissive- /Zc:__cplusplus /utf-8 /diagnostics:caret)
++    target_compile_options(${target} PRIVATE /W4 /EHsc /permissive- /Zc:__cplusplus /utf-8 /diagnostics:caret)
+     if(SUCH_STRICT_WARNINGS)
+       target_compile_options(${target} PRIVATE /WX)
+     endif()
+@@ -97,7 +100,7 @@ if(SUCH_BUILD_GUI)
+     set_target_properties(such_windows PROPERTIES OUTPUT_NAME "Such")
+     target_compile_definitions(such_windows PRIVATE UNICODE _UNICODE NOMINMAX _WIN32_WINNT=0x0A00 WINVER=0x0A00
+       $<$<BOOL:${SUCH_EXPERIMENTAL_LEADING_SWIPE}>:SUCH_EXPERIMENTAL_LEADING_SWIPE=1>)
+-    target_link_libraries(such_windows PRIVATE Such::Public user32 gdi32 shell32 ole32)
++    target_link_libraries(such_windows PRIVATE Such::Public user32 gdi32 shell32 ole32 comctl32)
+     such_strict(such_windows)
+     install(TARGETS such_windows RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+   elseif(APPLE AND CMAKE_SYSTEM_NAME STREQUAL "iOS")
+diff --git a/cmake/CheckDesignContract.cmake b/cmake/CheckDesignContract.cmake
+index 9555eba..2bf98cc 100644
+--- a/cmake/CheckDesignContract.cmake
++++ b/cmake/CheckDesignContract.cmake
+@@ -79,9 +79,14 @@ foreach(_forbidden_runtime_token "plan_default_index_policy" "recursive_director
+ endforeach()
+ 
+ file(READ "${_such_root_service}" _such_root_service_text)
+-string(FIND "${_such_root_service_text}" "plan_default_index_policy(request.path, false" _bounded_policy_call)
++string(FIND "${_such_root_service_text}" "plan_default_index_policy_set(policy_requests, false" _bounded_policy_call)
+ if(_bounded_policy_call EQUAL -1)
+-  message(FATAL_ERROR "IndexRootService must apply only bounded root policy on the caller path.")
++  message(FATAL_ERROR "IndexRootService must compile only bounded root-set policy on the caller path.")
++endif()
++string(FIND "${_such_root_service_text}" "runtime.replace_roots({}, &mutation_error)" _policy_reset_order)
++string(FIND "${_such_root_service_text}" "apply_exclusions(runtime, prepared.exclusions" _policy_seed_order)
++if(_policy_reset_order EQUAL -1 OR _policy_seed_order EQUAL -1 OR _policy_seed_order LESS _policy_reset_order)
++  message(FATAL_ERROR "IndexRootService must reset runtime roots before seeding exclusions for /drive.")
+ endif()
+ string(FIND "${_such_root_service_text}" "recursive_directory_iterator" _root_service_recursive_walk)
+ if(NOT _root_service_recursive_walk EQUAL -1)
+diff --git a/cmake/CheckWindowsCompileHazards.cmake b/cmake/CheckWindowsCompileHazards.cmake
+index 39eab85..80e125a 100644
+--- a/cmake/CheckWindowsCompileHazards.cmake
++++ b/cmake/CheckWindowsCompileHazards.cmake
+@@ -3,6 +3,8 @@
+ # known bad source patterns at configure time on every platform.
+ set(_such_win_src "${CMAKE_CURRENT_LIST_DIR}/../platform/windows/Win32Frontend.cpp")
+ set(_such_runtime_src "${CMAKE_CURRENT_LIST_DIR}/../src/runtime/RuntimeClient.cpp")
++set(_such_index_policy_src "${CMAKE_CURRENT_LIST_DIR}/../src/runtime/IndexPathPolicy.cpp")
++set(_such_process_control_src "${CMAKE_CURRENT_LIST_DIR}/../src/cli/ProcessControl.cpp")
+ set(_such_contract_test "${CMAKE_CURRENT_LIST_DIR}/../tests/public_contracts.cpp")
+ set(_such_runtime_test "${CMAKE_CURRENT_LIST_DIR}/../tests/runtime_client_smoke.cpp")
+ set(_such_search_dialect "${CMAKE_CURRENT_LIST_DIR}/../src/ui/SearchDialect.cpp")
+@@ -13,6 +15,8 @@ set(_such_cmake "${CMAKE_CURRENT_LIST_DIR}/../CMakeLists.txt")
+ foreach(_required
+     "${_such_win_src}"
+     "${_such_runtime_src}"
++    "${_such_index_policy_src}"
++    "${_such_process_control_src}"
+     "${_such_contract_test}"
+     "${_such_runtime_test}"
+     "${_such_search_dialect}"
+@@ -26,6 +30,8 @@ endforeach()
+ 
+ file(READ "${_such_win_src}" _such_win_text)
+ file(READ "${_such_runtime_src}" _such_runtime_text)
++file(READ "${_such_index_policy_src}" _such_index_policy_text)
++file(READ "${_such_process_control_src}" _such_process_control_text)
+ file(READ "${_such_contract_test}" _such_contract_text)
+ file(READ "${_such_runtime_test}" _such_runtime_test_text)
+ file(READ "${_such_search_dialect}" _such_search_dialect_text)
+@@ -104,4 +110,28 @@ if(NOT _unsafe_test_getenv EQUAL -1)
+   message(FATAL_ERROR "Rejected MSVC C4996-prone std::getenv in fake runtime")
+ endif()
+ 
++
++string(FIND "${_such_win_text}" "reinterpret_cast<WNDPROC>(SetWindowLongPtr" _unsafe_subclass_cast)
++if(NOT _unsafe_subclass_cast EQUAL -1)
++  message(FATAL_ERROR "Rejected C4191-prone Win32 WNDPROC subclass cast; use SetWindowSubclass")
++endif()
++string(FIND "${_such_win_text}" "SetWindowSubclass(" _subclass_helper)
++if(_subclass_helper EQUAL -1)
++  message(FATAL_ERROR "Win32 search EDIT must use SetWindowSubclass")
++endif()
++
++# Windows filesystem::path uses wchar_t. Never pass the wide comparable key to
++# UTF-8 policy APIs: that compiles on POSIX only and fails on MSVC.
++string(FIND "${_such_index_policy_text}" "is_windows_protected_index_path(path_key(" _wide_path_key_api)
++if(NOT _wide_path_key_api EQUAL -1)
++  message(FATAL_ERROR "Rejected Windows wide PathKey passed to UTF-8 policy API")
++endif()
++
++# EnumWindows requires a CALLBACK-compatible function pointer. Keep the explicit
++# CALLBACK thunk instead of relying on a non-capturing lambda conversion.
++string(FIND "${_such_process_control_text}" "BOOL CALLBACK close_such_window" _enum_callback)
++if(_enum_callback EQUAL -1)
++  message(FATAL_ERROR "Windows process control must use an explicit CALLBACK EnumWindows thunk")
++endif()
++
+ message(STATUS "Such Win32/MSVC known-hazard gate: PASS")
+diff --git a/include/such/cli/ProcessControl.h b/include/such/cli/ProcessControl.h
+index a2aa376..6e899d7 100644
+--- a/include/such/cli/ProcessControl.h
++++ b/include/such/cli/ProcessControl.h
+@@ -13,7 +13,9 @@ struct StopResult {
+     std::string error;
+ };
+ 
+-// Stops only exact Such process basenames and never the calling process.
++// Stops only exact Such process basenames that resolve under the current Such
++// executable root, and never the calling process. This prevents `such stop`
++// from terminating unrelated same-name programs elsewhere on the machine.
+ [[nodiscard]] StopResult stop_such_processes(bool force) noexcept;
+ 
+ } // namespace such::cli
+diff --git a/include/such/runtime/IndexPathPolicy.h b/include/such/runtime/IndexPathPolicy.h
+index 9c2a64e..1762e3c 100644
+--- a/include/such/runtime/IndexPathPolicy.h
++++ b/include/such/runtime/IndexPathPolicy.h
+@@ -20,6 +20,11 @@ struct IndexPathPolicyPlan {
+     std::vector<std::filesystem::path> exclusions;
+ };
+ 
++struct IndexPolicyRootRequest {
++    std::filesystem::path root;
++    IndexPolicyOverride override_mode = IndexPolicyOverride::None;
++};
++
+ // Conventional high-churn dependency/cache directories. Product root mutation
+ // paths identify these through deferred, bounded runtime-index maintenance so
+ // selecting a drive never triggers a synchronous recursive pre-scan. Explicit
+@@ -59,4 +64,11 @@ struct IndexPathPolicyPlan {
+     bool discover_noise_directories = false,
+     IndexPolicyOverride override_mode = IndexPolicyOverride::None);
+ 
++// Compile policy for a complete root set. Explicit AppData roots are global
++// exceptions: exclusions contributed by a broader root may not cover them.
++// This is the planner used by root replacement/reseed operations.
++[[nodiscard]] IndexPathPolicyPlan plan_default_index_policy_set(
++    const std::vector<IndexPolicyRootRequest>& roots,
++    bool discover_noise_directories = false);
++
+ } // namespace such::runtime
+diff --git a/include/such/runtime/IndexRootService.h b/include/such/runtime/IndexRootService.h
+index c052c76..64cd092 100644
+--- a/include/such/runtime/IndexRootService.h
++++ b/include/such/runtime/IndexRootService.h
+@@ -33,9 +33,10 @@ public:
+     [[nodiscard]] bool replace_roots(const std::vector<std::filesystem::path>& roots, std::string* error = nullptr);
+     [[nodiscard]] bool remove_root(const std::filesystem::path& root, std::string* error = nullptr);
+ 
+-    // Re-apply only bounded/fixed policy and then ask the private runtime to
+-    // rebuild asynchronously. No recursive filesystem walk occurs here.
+-    void reindex_async();
++    // Re-seed the current root set so stale exclusion state is cleared, apply
++    // bounded fixed policy, and let the private runtime rebuild asynchronously.
++    // No recursive filesystem walk occurs here.
++    [[nodiscard]] bool reindex_async(std::string* error = nullptr);
+ 
+     // Mark persisted roots for post-index maintenance, e.g. at GUI startup.
+     void refresh_policy_async();
+diff --git a/platform/windows/Win32Frontend.cpp b/platform/windows/Win32Frontend.cpp
+index 9f6a394..b956fbd 100644
+--- a/platform/windows/Win32Frontend.cpp
++++ b/platform/windows/Win32Frontend.cpp
+@@ -82,7 +82,6 @@ constexpr int kMenuIconFolder = 3202;
+ constexpr int kMenuIconFavorite = 3203;
+ 
+ HWND gSearch = nullptr;
+-WNDPROC gOldSearchProc = nullptr;
+ HFONT gSearchFont = nullptr;
+ HFONT gFilenameFont = nullptr;
+ HFONT gPathFont = nullptr;
+@@ -764,7 +763,9 @@ bool execute_index_command(HWND hwnd) {
+             break;
+         }
+         case such::ui::IndexCommandKind::Reindex:
+-            gRootService->reindex_async();
++            if (!gRootService->reindex_async(&error)) {
++                MessageBoxW(hwnd, widen_utf8("Could not rebuild index: " + error).c_str(), L"Such", MB_OK | MB_ICONWARNING);
++            }
+             break;
+         case such::ui::IndexCommandKind::ShowRoots:
+             // Keep /roots visible so the list remains inspectable.
+@@ -1426,7 +1427,10 @@ void move_selection(HWND hwnd, int delta) {
+     InvalidateRect(hwnd, nullptr, FALSE);
+ }
+ 
+-LRESULT CALLBACK search_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
++LRESULT CALLBACK search_subclass_proc(
++    HWND hwnd, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR subclass_id, DWORD_PTR reference_data) {
++    (void)subclass_id;
++    (void)reference_data;
+     HWND parent = GetParent(hwnd);
+     if (msg == WM_MOUSEWHEEL) {
+         return SendMessageW(parent, WM_MOUSEWHEEL, wp, lp);
+@@ -1458,7 +1462,10 @@ LRESULT CALLBACK search_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+             default: break;
+         }
+     }
+-    return CallWindowProcW(gOldSearchProc, hwnd, msg, wp, lp);
++    if (msg == WM_NCDESTROY) {
++        RemoveWindowSubclass(hwnd, search_subclass_proc, 1u);
++    }
++    return DefSubclassProc(hwnd, msg, wp, lp);
+ }
+ 
+ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+@@ -1473,8 +1480,11 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+             const std::wstring searchPlaceholder = widen_utf8(searchHint);
+             SendMessageW(gSearch, EM_SETCUEBANNER, TRUE,
+                          reinterpret_cast<LPARAM>(searchPlaceholder.c_str()));
+-            gOldSearchProc = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(gSearch, GWLP_WNDPROC,
+-                                                                         reinterpret_cast<LONG_PTR>(search_proc)));
++            if (SetWindowSubclass(gSearch, search_subclass_proc, 1u, 0u) == FALSE) {
++                DestroyWindow(gSearch);
++                gSearch = nullptr;
++                return -1;
++            }
+             layout_children(hwnd);
+             SetFocus(gSearch);
+             return 0;
+@@ -1890,7 +1900,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
+         gRuntimeIndexedFiles = status.indexed_files;
