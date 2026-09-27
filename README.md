@@ -20,6 +20,8 @@ This release tightens startup, indexing, desktop UI behavior, and release reprod
 - Linux startup root repair computes the final root set first and performs one replacement instead of repeated mutations.
 - Linux text input uses XIM/XIC with UTF-8 lookup when available, including UTF-8-safe deletion behavior.
 - Windows DPI/font refresh creates replacement fonts before releasing the old GDI handles used by the search control.
+- Windows search waits for a 300 ms typing pause before querying; `/inside` limits the live result set to 200 items to keep broad content searches responsive.
+- GitHub Actions runs the strict Windows x64 build, tests, source audit, runtime hash checks, and release staging on pushes and pull requests.
 - `/claude` and `/codex` do not install or upgrade the agent CLI. `SuchMCP` is built only when needed and a successful build is reused.
 - Linux release builds use a sealed repository-relative build context and ignore caller-provided compiler, build-directory, install-directory, runtime-path, and CMake override variables.
 - Such remains on-demand only. No Windows startup entry, service, scheduled task, systemd unit, or XDG autostart entry is installed.
@@ -139,7 +141,7 @@ scripts\build_windows.cmd -Clean
 scripts\verify_windows.cmd -Clean -RequireRuntime
 ```
 
-The Windows verification path includes the known-hazard/static audit and the pinned runtime PE/SHA checks. Native Win32/MSVC verification still has to run on a Windows host.
+The Windows verification path includes the known-hazard/static audit and the pinned runtime PE/SHA checks. The `Windows build and tests` GitHub Actions workflow runs this gate on a Windows host for pushes and pull requests.
 
 ## Validation
 
@@ -190,3 +192,4 @@ The production runtime binaries under `.runtime/` and the private Such SDK are o
 Contributions are governed by [`CONTRIBUTING.md`](CONTRIBUTING.md). Security issues should be reported according to [`SECURITY.md`](SECURITY.md). The public/private component boundary is documented in [`docs/PUBLIC_BOUNDARY.md`](docs/PUBLIC_BOUNDARY.md).
 
 **2026 Heritage Inc.**
+

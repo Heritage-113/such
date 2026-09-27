@@ -1,0 +1,32 @@
+name: Windows build and tests
+
+on:
+  push:
+    branches:
+      - main
+      - perf/inside-search
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-x64:
+    # Pin the image that provides the Visual Studio 2022 generator requested below.
+    runs-on: windows-2022
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Build, test, audit, and stage the Windows release
+        shell: pwsh
+        run: >-
+          ./scripts/build_windows.ps1
+          -Config Release
+          -Arch x64
+          -Generator 'Visual Studio 17 2022'
+          -Jobs 4
+          -RuntimeLibraryPath './.runtime/windows-x64/SuchRuntimePrivate.dll'
+          -RequireRuntime
+

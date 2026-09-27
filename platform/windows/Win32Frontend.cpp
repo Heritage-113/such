@@ -48,6 +48,7 @@ constexpr UINT kMsgCloseTransient = WM_APP + 2;
 constexpr UINT kMsgOpenSelected = WM_APP + 3;
 constexpr UINT kMsgEnsureIndexRoot = WM_APP + 4;
 constexpr UINT_PTR kTimerRuntimeRefresh = 3;
+constexpr UINT_PTR kTimerSearchDebounce = 4;
 
 constexpr float kSearchLeftContentInsetDip = 39.0f;
 constexpr float kSearchRightContentInsetDip = 44.0f;
@@ -910,6 +911,7 @@ std::vector<such::ui::ResultItem> root_items() {
 }
 
 void refresh_query(HWND hwnd, bool resetScroll = true) {
+    KillTimer(hwnd, kTimerSearchDebounce);
     const int len = GetWindowTextLengthW(gSearch);
     std::wstring text(static_cast<std::size_t>(std::max(0, len)) + 1, L'\0');
     if (len > 0) GetWindowTextW(gSearch, text.data(), len + 1);
@@ -936,11 +938,15 @@ void refresh_query(HWND hwnd, bool resetScroll = true) {
         else gResults.clear();
     } else {
         gSuggestions = such::ui::autocomplete(q, such::ui::PlatformDialect::Windows, observed);
+        const auto parsedSearch = such::ui::parse_search_query(
+            q, such::ui::PlatformDialect::Windows,
+            static_cast<std::int64_t>(std::time(nullptr)), observed);
+        const std::size_t resultLimit = parsedSearch.scope == such::ui::SearchScope::Content ? 200u : 0u;
         if (gDemo) {
             const auto now = static_cast<std::int64_t>(std::time(nullptr));
             gResults = such::ui::make_demo_results(q, such::ui::PlatformDialect::Windows, now);
         } else if (gRuntime) {
-            gResults = gRuntime->search(q, such::ui::PlatformDialect::Windows, 0, &gSearchError);
+            gResults = gRuntime->search(q, such::ui::PlatformDialect::Windows, resultLimit, &gSearchError);
         } else {
             gResults.clear();
         }
@@ -1515,7 +1521,10 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return reinterpret_cast<LRESULT>(gSearchBrush);
         }
         case WM_COMMAND:
-            if (LOWORD(wp) == kSearchId && HIWORD(wp) == EN_CHANGE) refresh_query(hwnd);
+            if (LOWORD(wp) == kSearchId && HIWORD(wp) == EN_CHANGE) {
+                KillTimer(hwnd, kTimerSearchDebounce);
+                SetTimer(hwnd, kTimerSearchDebounce, 300, nullptr);
+            }
             return 0;
         case kMsgAutocomplete:
             autocomplete_first(hwnd);
@@ -1782,6 +1791,11 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         case WM_TIMER:
             if (wp == 1 || wp == 2) { DestroyWindow(hwnd); return 0; }
+            if (wp == kTimerSearchDebounce) {
+                KillTimer(hwnd, kTimerSearchDebounce);
+                refresh_query(hwnd);
+                return 0;
+            }
             if (wp == kTimerRuntimeRefresh && gRuntime) {
                 const auto status = gRuntime->status();
                 const auto generation = status.generation;
@@ -1810,6 +1824,7 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 gSearchBrush = nullptr;
             }
             KillTimer(hwnd, kTimerRuntimeRefresh);
+            KillTimer(hwnd, kTimerSearchDebounce);
             gRuntime.reset();
             PostQuitMessage(0);
             return 0;
@@ -1939,3 +1954,4 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     }
     return static_cast<int>(msg.wParam);
 }
+
