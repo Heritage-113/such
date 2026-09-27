@@ -37,5 +37,6 @@ Publish this tree itself. Never create the public repository by copying the priv
 - `Security` toggle sits directly below it.
 - No Enterprise activation => fail-closed notice directing users to https://such.heritage-labs.net.
 - Heritage Secure Core is temporarily removed from this build; the Security toggle remains fail-closed and shows the Enterprise contact notice only.
-- SuchRuntimePrivate v0.7.0 remains the `/inside` content-search runtime.
+- The Windows bundle uses SuchRuntimePrivate v0.8.0 for `/inside`; the Linux bundle retains its pinned v0.7.0 runtime until the matching Linux optimization build is available.
 - Windows install root is `C:\Heritage\Such`; no self-exclusion rule is used. `%APPDATA%` and `%LOCALAPPDATA%` are opt-in aliases in the Windows search field, while automatic AppData indexing remains blocked.
+
