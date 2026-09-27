@@ -13,7 +13,8 @@ permissions:
 
 jobs:
   windows-x64:
-    runs-on: windows-latest
+    # Pin the image that provides the Visual Studio 2022 generator requested below.
+    runs-on: windows-2022
     steps:
       - name: Check out source
         uses: actions/checkout@v4
