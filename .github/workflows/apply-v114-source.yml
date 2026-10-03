@@ -1,0 +1,80 @@
+name: Apply Such v1.1.6 source
+
+on:
+  push:
+    branches:
+      - automation/v1.1.4-public-refresh
+    paths:
+      - '.github/source-bundle-ready'
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Apply v1.1.6 source payload
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat .github/source-bundle-*.b64 | base64 -d > /tmp/such-v1.1.6.tar.xz
+          xz -t /tmp/such-v1.1.6.tar.xz
+          tar -xJf /tmp/such-v1.1.6.tar.xz -C .
+
+          rm -f \
+            BUILD_VALIDATION_v1.0.0.md \
+            BUILD_VALIDATION_v1.0.0_Windows.md \
+            CODE_REVIEW_v1.0.0.md \
+            docs/DEVELOPMENT_HANDOFF_v1.0.0.md \
+            runtime/RUNTIME_SHA256_v1.0.0.txt
+
+          mkdir -p .runtime/linux-x64/licenses
+          cp .runtime/SuchRuntimePrivate_v0.6.2_Linux_x64_RuntimeOnly/libSuchRuntimePrivate.so .runtime/linux-x64/libSuchRuntimePrivate.so
+          cp .runtime/SuchRuntimePrivate_v0.6.2_Linux_x64_RuntimeOnly/LEGAL_NOTICE.txt .runtime/linux-x64/LEGAL_NOTICE.txt
+          cp .runtime/SuchRuntimePrivate_v0.6.2_Linux_x64_RuntimeOnly/licenses/TopoDB-Apache-2.0-LICENSE.txt .runtime/linux-x64/licenses/TopoDB-Apache-2.0-LICENSE.txt
+          cp .runtime/SuchRuntimePrivate_v0.6.2_Linux_x64_RuntimeOnly/licenses/TopoDB-NOTICE.txt .runtime/linux-x64/licenses/TopoDB-NOTICE.txt
+          rm -rf .runtime/SuchRuntimePrivate_v0.6.2_Linux_x64_RuntimeOnly
+
+          rm -f .github/source-bundle-*.b64
+          rm -f .github/source-bundle-ready
+          rm -f .github/workflows/apply-v114-source.yml
+
+      - name: Verify public tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/audit_repository_layout.py
+
+      - name: Verify hermetic Linux build
+        shell: bash
+        run: |
+          set -euo pipefail
+          env -i \
+            HOME=/tmp/such-host-home \
+            PATH=/definitely/not/a/real/path \
+            CC=/bin/false \
+            CXX=/bin/false \
+            CONFIG=Debug \
+            BUILD_DIR=/tmp/redirected-build \
+            INSTALL_DIR=/tmp/redirected-install \
+            JOBS=1 \
+            RUNTIME_LIBRARY_PATH=/tmp/not-the-runtime.so \
+            CMAKE_TOOLCHAIN_FILE=/tmp/not-a-toolchain.cmake \
+            /bin/bash -p scripts/build_linux.sh --clean --require-runtime
+
+      - name: Publish clean v1.1.6 staging commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'Heritage Inc.'
+          git config user.email 'jimin@heritage-labs.net'
+          git add -A
+          tree_sha="$(git write-tree)"
+          parent_sha="$(git rev-parse origin/main)"
+          commit_sha="$(printf '%s\n\n%s\n' 'Release Such v1.1.6' 'Refresh public Such, preserve non-resident startup, seal Linux build inputs, and use the native Windows search cue banner.' | git commit-tree "$tree_sha" -p "$parent_sha")"
+          git push --force origin "$commit_sha:refs/heads/automation/v1.1.4-public-refresh"
