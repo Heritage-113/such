@@ -137,6 +137,7 @@ scripts/linux_step_stage.sh
 scripts/linux_step_test.sh
 scripts/prepare_windows_offline_toolchain.cmd
 scripts/prepare_windows_offline_toolchain.ps1
+scripts/package_source.py
 scripts/qualify_ipados.sh
 scripts/qualify_linux.sh
 scripts/qualify_windows.cmd
@@ -195,6 +196,7 @@ tests/index_worker_launcher_smoke.cpp
 tests/installer_source_contract.py
 tests/linux_index_roots.cpp
 tests/public_contracts.cpp
+tests/source_package_contract.py
 tests/runtime_client_smoke.cpp
 tests/x11_input_driver.cpp
 third_party/windows/bootstrap/DOWNLOAD_MANIFEST.txt

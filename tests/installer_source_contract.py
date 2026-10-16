@@ -31,7 +31,7 @@ checks={
  'Windows GUI/CLI PE versions generated': 'SuchVersion.rc.in' in cmake and 'SuchCLI_version.rc' in cmake and 'SuchGUI_version.rc' in cmake,
  'PE authority fields generated': '@PROJECT_VERSION_PATCH@' in resources and '"@PROJECT_VERSION@\\0"' in resources,
  'Inno Setup 7 native x64 setup': 'SetupArchitecture=x64' in iss and 'ArchitecturesAllowed=x64compatible' not in iss,
- 'Inno Setup 7 only compiler': 'FileMajorPart -eq 7' in inno and 'Inno Setup 6' not in builder,
+ 'Inno Setup 7 only compiler': "@('--version')" in inno and r"$result.StdOut.Trim() -match '^7\." in inno and 'Inno Setup 6' not in builder,
  'Inno Setup secure auto provision': all(x in inno for x in ('Invoke-WebRequest', 'Get-FileHash', 'Get-AuthenticodeSignature', 'Pyrsys B', 'Invoke-SuchNative', 'OfflineOnly')),
  'Release asset pinned': 'InnoSetupVersion=7.1.0' in inno_assets and 'InnoSetupSha256=0362a383ed217d4c4239b5933866dd96d3eb2102737da92f80f6057a4b40df2f' in inno_assets,
  'Windows audit generated class contract': 'kWindowClassName' in win_audit and 'Version.h.in' in win_audit and "VersionTag.Substring" not in win_audit and '@PROJECT_VERSION_PATCH@' in version_header,

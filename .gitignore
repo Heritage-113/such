@@ -17,3 +17,7 @@
 # Generated source/release archives
 /Such*.zip
 /Such*.7z
+
+# Python validation and packaging bytecode
+__pycache__/
+*.py[cod]

@@ -10,10 +10,12 @@ https://such.heritage-labs.net
 
 ## v1.3.5
 
-- The product version is centrally defined by `VERSION` and used for Windows/Linux titles, Windows class identity, release package names and installation metadata.
-- Windows double-click `.cmd` workflows keep the result visible. CI and scripted runs preserve exit codes without waiting.
-- Private Runtime Fix5 is still independently versioned and bundled unchanged; the pinned runtime hashes are in `runtime/RUNTIME_SHA256.txt`.
-- Windows installer definition (`installer/Such.iss`) and build entry point (`scripts/build_installer_windows.cmd`) produce a per-user setup EXE in ignored `dist/installers/` after Windows MSVC verification. GUI/CLI PE file/product version metadata is generated from `VERSION`.
+- `VERSION` is the sole product-version authority for Windows/Linux titles, Win32 class identity, PE metadata, release names and the Inno Setup installer. The Private Runtime has its own version and pinned SHA-256.
+- Windows indexing publishes a read-only filename checkpoint before content indexing finishes. Filename/path search can start earlier; `/inside` waits for completed content indexing. See [`docs/FAST_INDEXING.md`](docs/FAST_INDEXING.md).
+- `/index auto|1|2|4|8|16` selects the TopoDB shard count for a rebuild. The selection is saved. Automatic mode remains the default; shard-count tuning is not a guaranteed whole-drive speedup.
+- Daily index refresh runs only while Such is in use. IME composition does not issue intermediate Korean content queries, and `/inside` remains text-only. The private commit acknowledgment and native IME qualification remain separate release checks.
+- Windows `.cmd` workflows keep diagnostics visible when launched directly; scripted/CI runs retain the exit code. The installer uses Inno Setup **7**, found locally or downloaded and verified when needed, never shipped as a toolchain inside the source archive.
+- Source releases are built with `scripts/package_source.py` from `PACKAGE_MANIFEST.txt`. Build outputs, Inno Setup caches, offline toolchains and other local dependencies are excluded. Approved Windows/Linux Runtime DLL/SO files and their notices remain included.
 
 ## v1.3.0 (previous source baseline)
 
@@ -60,6 +62,8 @@ such root                show roots
 such root ~/Work         replace root
 such root + /mnt/archive add root
 such scan                rebuild index
+such /index auto         choose automatic index shards
+such /index 4            rebuild with four TopoDB shards
 such status              index status
 such snapshot export <file.sidx>  carry current index
 such snapshot import <file.sidx>  restore without full crawl
@@ -166,7 +170,10 @@ Windows:
 scripts\doctor_windows.cmd
 scripts\build_windows.cmd -Clean
 scripts\verify_windows.cmd -RequireRuntime
+scripts\build_installer_windows.cmd -Config Release -Arch x64 -Clean
 ```
+
+The setup builder verifies the current Windows source, PE versions and approved runtime before compiling. If Inno Setup 7 is absent, the official compiler is downloaded with pinned SHA-256 and signature verification. The generated `dist/installers/Such_vVERSION_Windows_x64_Setup.exe` is ignored by Git. No installer compiler is included in the source bundle.
 
 The Windows pipeline keeps atomic implementation steps, but every public workflow is independently runnable. `bootstrap_windows` owns toolchain preparation; `windows_step_build` owns configure/build; `windows_step_test` owns CTest/runtime smoke; `windows_step_stage` is toolchain-free and copies SHA-attested artifacts; install and release consume only staged artifacts. `verify_windows` composes audit/bootstrap/build/test, `install_windows` continues through stage/install, and `release_windows` continues through stage/package. `doctor_windows` remains diagnostic-only. The authoritative compiler is Visual Studio 2022/MSVC with `/W4 /WX`; portable CMake 3.31.12 remains SHA-256 pinned. Every public Windows `.cmd` workflow runs through the central PowerShell host shim. It pins PowerShell 7.6.6 as the default portable workflow host, verifies the official archive SHA-256 before materialization, and uses Windows PowerShell 5.1 only as the first-run bootstrap bridge when the pinned host is not already cached.
 
@@ -176,7 +183,7 @@ For disconnected Windows hosts, create the official Visual Studio Build Tools ne
 scripts\prepare_windows_offline_toolchain.cmd
 ```
 
-The Visual Studio layout is intentionally kept **outside the repository** because its deeply nested package paths can exceed Windows/MSBuild/FileTracker path limits when combined with a long checkout path. The default offline root is `%USERPROFILE%\STC\offline`, with the VS layout under `%USERPROFILE%\STC\offline\VS17`; `SUCH_WINDOWS_OFFLINE_ROOT` or `SUCH_VS_OFFLINE_LAYOUT` can override it (for example `C:\S\TC`). For a fully disconnected first run, place the architecture-appropriate official PowerShell 7.6.6 ZIP in the same offline root before copying it to the disconnected machine, then run `scripts\bootstrap_windows.cmd -OfflineOnly`. The installer uses `--noWeb`. Windows build/stage/verify state is likewise kept outside the source tree under `%USERPROFILE%\SW` by default, so `install_windows` and `verify_windows` do not inherit the checkout's path depth. Native Win32/MSVC execution of this bootstrap path must still be qualified on a Windows host.
+The Visual Studio layout is intentionally kept **outside the repository** because its deeply nested package paths can exceed Windows/MSBuild/FileTracker path limits when combined with a long checkout path. The default offline root is `%USERPROFILE%\STC\offline`, with the VS layout under `%USERPROFILE%\STC\offline\VS17`; `SUCH_WINDOWS_OFFLINE_ROOT` or `SUCH_VS_OFFLINE_LAYOUT` can override it (for example `C:\S\TC`). For a fully disconnected first run, place the architecture-appropriate official PowerShell 7.6.6 ZIP in the same offline root before copying it to the disconnected machine, then run `scripts\bootstrap_windows.cmd -OfflineOnly`. The Visual Studio layout installer uses `--noWeb`. Windows build/stage/verify state is likewise kept outside the source tree under `%USERPROFILE%\SW` by default, so `install_windows` and `verify_windows` do not inherit the checkout's path depth. Native Win32/MSVC execution of this bootstrap path must still be qualified on a Windows host.
 
 ## Validation
 
@@ -186,7 +193,7 @@ Platform-specific gates remain separate: Windows requires the native `verify_win
 
 ## Linux build dependencies and per-user release
 
-On **Debian 13 amd64**, the closed-network dependency set is bundled under `third_party/linux/offline/debian13-amd64/`: 204 pinned `.deb` packages plus a local APT index and SHA-256 manifest cover build and strict verification. If a required capability is missing on that qualified target, the build tooling uses the bundled `file://` repository first and does not load the host's configured network mirrors. `scripts/bootstrap_linux_offline.sh` may also be run explicitly before entering a closed network.
+On **Debian 13 amd64**, a separate closed-network dependency bundle can be prepared under `third_party/linux/offline/debian13-amd64/` using the maintained offline-bundle workflow. The public source archive does not vendor the `.deb` packages. If a required capability is missing on that qualified target, the build tooling uses the bundled `file://` repository first and does not load the host's configured network mirrors. `scripts/bootstrap_linux_offline.sh` may also be run explicitly before entering a closed network.
 
 Other Linux distributions keep the package-manager fallback (`dnf`/`yum`, `zypper`, or `pacman`) when a capability is missing. Those branches do not consume the Debian 13 binary bundle and remain platform-unverified until exercised on their native hosts.
 
@@ -212,9 +219,18 @@ runtime/
   linux-x64/libSuchRuntimePrivate.so
 ```
 
-Linux builds use a sealed build context: repository-relative build/install directories, a fixed system tool search set, cleared compiler/linker/CMake override variables, and the approved runtime at `runtime/linux-x64/libSuchRuntimePrivate.so`. Caller-provided build environment variables do not redirect the build. Approved runtime hashes are pinned in `runtime/RUNTIME_SHA256.txt`. The bundled Windows/Linux Fix5 runtimes export the optional ABI-v1 content-search entry point used by `/inside`.
+Linux builds use a sealed build context: repository-relative build/install directories, a fixed system tool search set, cleared compiler/linker/CMake override variables, and the approved runtime at `runtime/linux-x64/libSuchRuntimePrivate.so`. Caller-provided build environment variables do not redirect the build. Approved runtime hashes are pinned in `runtime/RUNTIME_SHA256.txt`. The bundled Windows/Linux runtime artifacts export the optional ABI-v1 content-search entry point used by `/inside`. The Windows binary has been updated for the filename-checkpoint/sharding work; do not substitute an older Fix5 DLL.
 
 The production runtime binaries under `runtime/` are separate Heritage Inc. artifacts and are not covered by the public Apache-2.0 source license.
+
+## Source package
+
+```bash
+python3 scripts/package_source.py
+python3 tests/source_package_contract.py
+```
+
+The resulting `dist/source/Such_vVERSION_SourceOnly.zip` contains the audited source, build scripts and approved Runtime DLL/SO files. It does **not** contain `.cache/`, toolchain downloads, build trees or installer binaries. The name `SourceOnly` describes the absence of private implementation source, not the absence of the separately licensed production runtimes.
 
 ## SDK and commercial integration
 
