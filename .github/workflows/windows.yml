@@ -19,14 +19,15 @@ jobs:
       - name: Check out source
         uses: actions/checkout@v4
 
-      - name: Build, test, audit, and stage the Windows release
+      # The release entry owns audit, build, CTest, GUI/CLI smokes, stage and archive.
+      # build_windows.ps1 deliberately has no -RuntimeLibraryPath/-RequireRuntime flags.
+      - name: Audit, build, verify, stage, and package the Windows release
         shell: pwsh
         run: >-
-          ./scripts/build_windows.ps1
+          ./scripts/release_windows.ps1
           -Config Release
           -Arch x64
           -Generator 'Visual Studio 17 2022'
           -Jobs 4
           -RuntimeLibraryPath './runtime/windows-x64/SuchRuntimePrivate.dll'
-          -RequireRuntime
 
