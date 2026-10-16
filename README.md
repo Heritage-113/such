@@ -120,6 +120,48 @@ On Windows, Such installs for the current user under `%LOCALAPPDATA%\Programs\Su
 
 ## Benchmark
 
+### v1.3.5 — Linux search comparison
+
+Controlled synthetic-file corpus: 10,000 / 100,000 / 500,000 files (`cpp`, `txt`, `dwg`, `png`, `json`), about 2.0 GiB at 500k. Measured on Linux/overlayfs with an AMD EPYC 9V74 host (5 available CPUs), a warm OS page cache and the approved Linux Private Runtime. Such's index had already been built before search timing.
+
+- **Such engine:** one loaded Runtime, C ABI search, 5 warm-ups + 40 runs; median query time, excluding process startup and GUI rendering.
+- **GNU `find`:** direct recursive filename search, 2 warm-ups + 7 runs; median.
+- **`ripgrep` (`rg`):** direct file-content search, 2 warm-ups + 7 runs; median. This is a separate CLI tool, not an OS desktop search index.
+- **Such CLI:** new process and Runtime reload for every query, 1 warm-up + 5 runs; median end-to-end time.
+
+| Files | Query | Matches | Such loaded engine | Direct scan | Direct / Such |
+|---:|:---|---:|---:|---:|---:|
+| 10,000 | exact filename (`find`) | 1 | 0.0167 ms | 7.3354 ms | 439x |
+| 100,000 | exact filename (`find`) | 1 | 0.0233 ms | 51.2154 ms | 2,198x |
+| 500,000 | exact filename (`find`) | 1 | 0.0517 ms | 258.4444 ms | 4,999x |
+| 10,000 | content (`rg`) | 7 | 0.0346 ms | 19.3542 ms | 559x |
+| 100,000 | content (`rg`) | 61 | 0.4067 ms | 112.6521 ms | 277x |
+| 500,000 | content (`rg`) | 301 | 2.3306 ms | 533.4290 ms | 229x |
+
+At 500k files, query selectivity changes the difference:
+
+| Query | Matches | Such loaded engine | Direct scan | Direct / Such |
+|:---|---:|---:|---:|---:|
+| Exact filename | 1 | 0.0517 ms | 258.4444 ms | 4,999x |
+| Filename not found | 0 | 0.0364 ms | 243.1365 ms | 6,680x |
+| Broad filename (`engineering_plan`) | 99,999 | 60.6055 ms | 247.0513 ms | 4.1x |
+| DWG extension | 100,000 | 50.4201 ms | 260.4385 ms | 5.2x |
+| Text content | 301 | 2.3306 ms | 533.4290 ms | 229x |
+
+**Starting SuchCLI for every query is slower than the direct scan** in this benchmark, because it reloads the Runtime and index:
+
+| Files | SuchCLI exact filename | GNU `find` | SuchCLI `/inside` | `rg` |
+|---:|---:|---:|---:|---:|
+| 10,000 | 28.69 ms | 7.34 ms | 29.19 ms | 19.35 ms |
+| 100,000 | 300.62 ms | 51.22 ms | 372.29 ms | 112.65 ms |
+| 500,000 | 1,829.51 ms | 258.44 ms | 2,561.02 ms | 533.43 ms |
+
+The 500k-file **initial** Such indexing run took 59.72 s, used about 334.3 MiB of disk storage and reached 1,202.8 MiB peak RSS. The indexing and freshness costs are excluded from warm-query numbers. Result counts were checked against the deterministic corpus and direct scans; Such CLI `/inside` prints snippets whereas the `rg -l` baseline prints matching filenames, so the CLI outputs differ in size.
+
+**Scope:** These ratios compare a warm **indexed** search engine with direct **unindexed** scans, not with another indexed engine. They do not measure GUI response time. Windows Explorer / Windows Search, Linux desktop indexers, Windows v1.3.5 DLL multisharding and actual Windows IME behavior were **not measured** in this Linux test. No Windows Search speedup is claimed.
+
+### Earlier Linux benchmark (different host and corpus)
+
 Controlled synthetic-file benchmark on:
 
 - CPU: Intel Xeon Platinum 8573C
@@ -153,7 +195,6 @@ The same pattern persisted on tmpfs: at 100k files, raw state read was about **2
 That gap shows that Linux startup cost is dominated by work after raw I/O. The current evidence does not isolate the exact private-runtime function responsible. Native profiling is required before changing the storage format or adding a resident service.
 
 Full benchmark methodology and performance notes are in [`docs/LINUX_PERFORMANCE.md`](docs/LINUX_PERFORMANCE.md).
-
 ## Build
 
 Linux:
