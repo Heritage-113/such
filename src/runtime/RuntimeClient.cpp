@@ -1,6 +1,7 @@
 #include <such/runtime/RuntimeClient.h>
 #include <such/runtime/RuntimeABI.h>
-#include <such/runtime/IndexPathPolicy.h>
+#include <such/runtime/SearchableFiles.h>
+#include <such/ui/HangulQueryNfc.h>
 
 #include <cstdlib>
 #include <array>
@@ -53,23 +54,6 @@ std::string path_to_utf8(const std::filesystem::path& path) {
 #else
     return path.string();
 #endif
-}
-
-struct RootRequest {
-    std::filesystem::path path;
-    IndexPolicyOverride override_mode = IndexPolicyOverride::None;
-};
-
-RootRequest resolve_root_request(const std::filesystem::path& requested) {
-#if defined(_WIN32)
-    const auto raw = path_to_utf8(requested);
-    if (is_windows_manual_index_alias(raw)) {
-        if (const auto resolved = resolve_windows_manual_index_alias(raw)) {
-            return {*resolved, IndexPolicyOverride::ExplicitCurrentUserAppData};
-        }
-    }
-#endif
-    return {requested, IndexPolicyOverride::None};
 }
 
 std::filesystem::path executable_directory() {
@@ -148,56 +132,6 @@ int append_result(void* user, const such_runtime_result_v1* value) {
     return 1;
 }
 
-
-bool path_component_equal(std::string_view lhs, std::string_view rhs) {
-    if (lhs.size() != rhs.size()) return false;
-    for (std::size_t i = 0; i < lhs.size(); ++i) {
-#if defined(_WIN32)
-        if (std::tolower(static_cast<unsigned char>(lhs[i])) !=
-            std::tolower(static_cast<unsigned char>(rhs[i]))) return false;
-#else
-        if (lhs[i] != rhs[i]) return false;
-#endif
-    }
-    return true;
-}
-
-std::optional<std::string> directory_prefix_for_component(std::string_view path, std::string_view target) {
-    std::size_t start = 0;
-    while (start < path.size()) {
-        while (start < path.size() && (path[start] == '/' || path[start] == '\\')) ++start;
-        if (start >= path.size()) break;
-        std::size_t end = start;
-        while (end < path.size() && path[end] != '/' && path[end] != '\\') ++end;
-        if (path_component_equal(path.substr(start, end - start), target)) {
-            return std::string(path.substr(0, end));
-        }
-        start = end + 1;
-    }
-    return std::nullopt;
-}
-
-struct NoiseScrubContext {
-    std::string_view target;
-    std::unordered_set<std::string> seen;
-    std::vector<std::string> directories;
-};
-
-int collect_noise_directory(void* user, const such_runtime_result_v1* value) {
-    if (user == nullptr || value == nullptr || value->path == nullptr) return 0;
-    auto* context = static_cast<NoiseScrubContext*>(user);
-    const auto prefix = directory_prefix_for_component(value->path, context->target);
-    if (!prefix.has_value()) return 1;
-    std::string key = *prefix;
-#if defined(_WIN32)
-    std::transform(key.begin(), key.end(), key.begin(), [](unsigned char c) {
-        return static_cast<char>(std::tolower(c));
-    });
-#endif
-    if (context->seen.insert(std::move(key)).second) context->directories.push_back(*prefix);
-    return 1;
-}
-
 int append_content_result(void* user, const such_runtime_content_result_v1* value) {
     if (user == nullptr || value == nullptr) return 0;
     auto* out = static_cast<std::vector<such::ui::ResultItem>*>(user);
@@ -239,7 +173,7 @@ struct RuntimeClient::Impl {
     using EngineStatsFn = int (*)(such_runtime_handle_v1, such_runtime_engine_stats_v1*);
     using GenerationFn = std::uint64_t (*)(such_runtime_handle_v1);
 
-    explicit Impl(std::filesystem::path state) : state_dir(std::move(state)) {}
+    explicit Impl(std::filesystem::path state, bool reader) : state_dir(std::move(state)), read_only(reader) {}
     ~Impl() { reset_loaded_state(); }
 
     void reset_loaded_state() noexcept {
@@ -337,6 +271,10 @@ struct RuntimeClient::Impl {
         if (abi_version() != SUCH_RUNTIME_ABI_VERSION) {
             return fail_and_reset("Such private runtime ABI version mismatch");
         }
+        if (read_only) {
+            bind_optional(create, "such_runtime_create_readonly_v1");
+            if (create == nullptr) return fail_and_reset("This runtime does not support filename snapshots during indexing");
+        }
         const std::string state_utf8 = state_dir.empty() ? std::string{} : path_to_utf8(state_dir);
         runtime = create(state_utf8.empty() ? nullptr : state_utf8.c_str());
         if (runtime == nullptr) {
@@ -357,72 +295,6 @@ struct RuntimeClient::Impl {
         return true;
     }
 
-    void apply_existing_index_policy() {
-        if (runtime == nullptr || set_indexed_fn == nullptr) return;
-
-        // Fast fixed-path migration for existing roots. This immediately hides
-        // old AppData/Windows rows after an upgrade without requiring a full
-        // reindex. New root mutations still run the full pre-crawl discovery.
-        std::vector<std::string> root_values;
-        if (list_roots_fn != nullptr && list_roots_fn(runtime, append_string, &root_values) != 0) {
-            for (const auto& value : root_values) {
-                const auto root_path = std::filesystem::path(value);
-                const auto mode = is_current_user_manual_appdata_root(root_path)
-                    ? IndexPolicyOverride::ExplicitCurrentUserAppData
-                    : IndexPolicyOverride::None;
-                const auto plan = plan_default_index_policy(root_path, false, mode);
-                if (!plan.root_allowed) {
-                    (void)set_indexed_fn(runtime, value.c_str(), 0);
-                    continue;
-                }
-                for (const auto& excluded : plan.exclusions) {
-                    const auto path = path_to_utf8(excluded);
-                    (void)set_indexed_fn(runtime, path.c_str(), 0);
-                }
-            }
-        }
-
-        // Existing catalogs from older builds may already contain dependency
-        // trees. Find their concrete directory prefixes through the file index,
-        // then convert them to persistent subtree exclusions. Subsequent starts
-        // see no matching rows, so this migration becomes three cheap queries.
-        const std::array<std::string_view, 3> noise{{"node_modules", ".git", "__pycache__"}};
-#if defined(_WIN32)
-        constexpr std::uint32_t raw_dialect = 0u;
-#else
-        constexpr std::uint32_t raw_dialect = 1u;
-#endif
-        for (const auto name : noise) {
-            NoiseScrubContext context{name, {}, {}};
-            if (search_fn(runtime, std::string(name).c_str(), raw_dialect, 0, collect_noise_directory, &context) == 0) continue;
-            for (const auto& directory : context.directories) {
-                (void)set_indexed_fn(runtime, directory.c_str(), 0);
-            }
-        }
-    }
-
-    bool apply_index_policy(const std::filesystem::path& root,
-                            bool discover_noise_directories,
-                            IndexPolicyOverride override_mode,
-                            std::string* out_error) {
-        const auto plan = plan_default_index_policy(root, discover_noise_directories, override_mode);
-        if (!plan.root_allowed) {
-            error = plan.rejection_reason.empty() ? "Search root is blocked by the default index policy" : plan.rejection_reason;
-            if (out_error != nullptr) *out_error = error;
-            return false;
-        }
-        for (const auto& excluded : plan.exclusions) {
-            const auto value = path_to_utf8(excluded);
-            if (set_indexed_fn(runtime, value.c_str(), 0) == 0) {
-                const auto abi = abi_error();
-                error = abi.empty() ? "Such could not apply a default index exclusion: " + value : abi;
-                if (out_error != nullptr) *out_error = error;
-                return false;
-            }
-        }
-        return true;
-    }
-
     std::string abi_error() const {
         if (runtime != nullptr && last_error_fn != nullptr) {
             if (const char* value = last_error_fn(runtime); value != nullptr && *value != '\0') return value;
@@ -436,6 +308,7 @@ struct RuntimeClient::Impl {
     }
 
     std::filesystem::path state_dir;
+    bool read_only = false;
     mutable std::string error;
     LibraryHandle library = nullptr;
     such_runtime_handle_v1 runtime = nullptr;
@@ -461,8 +334,8 @@ struct RuntimeClient::Impl {
     GenerationFn generation_fn = nullptr;
 };
 
-RuntimeClient::RuntimeClient(std::filesystem::path state_directory)
-    : impl_(std::make_unique<Impl>(std::move(state_directory))) {}
+RuntimeClient::RuntimeClient(std::filesystem::path state_directory, bool read_only)
+    : impl_(std::make_unique<Impl>(std::move(state_directory), read_only)) {}
 RuntimeClient::~RuntimeClient() = default;
 
 bool RuntimeClient::load(std::string* error) {
@@ -473,14 +346,17 @@ bool RuntimeClient::load(std::string* error) {
     return true;
 }
 
+void RuntimeClient::unload() noexcept {
+    impl_->reset_loaded_state();
+    impl_->error.clear();
+}
+
 bool RuntimeClient::available() const noexcept { return impl_->ready; }
 std::string RuntimeClient::last_error() const { return impl_->runtime_error(); }
 
 bool RuntimeClient::add_root(const std::filesystem::path& root, std::string* error) {
     if (!impl_->ensure_ready()) { if (error != nullptr) *error = impl_->runtime_error(); return false; }
-    const auto request = resolve_root_request(root);
-    if (!impl_->apply_index_policy(request.path, true, request.override_mode, error)) return false;
-    const auto path = path_to_utf8(request.path);
+    const auto path = path_to_utf8(root);
     const bool ok = impl_->add_root_fn(impl_->runtime, path.c_str()) != 0;
     if (ok) impl_->error.clear();
     else if (error != nullptr) *error = impl_->runtime_error();
@@ -498,18 +374,11 @@ bool RuntimeClient::remove_root(const std::filesystem::path& root, std::string* 
 
 bool RuntimeClient::replace_roots(const std::vector<std::filesystem::path>& roots_value, std::string* error) {
     if (!impl_->ensure_ready()) { if (error != nullptr) *error = impl_->runtime_error(); return false; }
-    std::vector<RootRequest> requests;
-    requests.reserve(roots_value.size());
-    for (const auto& root : roots_value) {
-        auto request = resolve_root_request(root);
-        if (!impl_->apply_index_policy(request.path, true, request.override_mode, error)) return false;
-        requests.push_back(std::move(request));
-    }
     std::vector<std::string> storage;
     std::vector<const char*> pointers;
-    storage.reserve(requests.size());
-    pointers.reserve(requests.size());
-    for (const auto& request : requests) storage.push_back(path_to_utf8(request.path));
+    storage.reserve(roots_value.size());
+    pointers.reserve(roots_value.size());
+    for (const auto& root : roots_value) storage.push_back(path_to_utf8(root));
     for (const auto& value : storage) pointers.push_back(value.c_str());
     const bool ok = impl_->replace_roots_fn(impl_->runtime, pointers.data(), pointers.size()) != 0;
     if (ok) impl_->error.clear();
@@ -536,17 +405,6 @@ std::vector<std::string> RuntimeClient::roots(std::string* error) const {
 
 void RuntimeClient::reindex_async() {
     if (!impl_->ready || impl_->runtime == nullptr || impl_->reindex_async_fn == nullptr) return;
-    std::vector<std::string> root_values;
-    if (impl_->list_roots_fn != nullptr && impl_->list_roots_fn(impl_->runtime, append_string, &root_values) != 0) {
-        for (const auto& value : root_values) {
-            const auto root_path = std::filesystem::path(value);
-            const auto mode = is_current_user_manual_appdata_root(root_path)
-                ? IndexPolicyOverride::ExplicitCurrentUserAppData
-                : IndexPolicyOverride::None;
-            std::string ignored_error;
-            (void)impl_->apply_index_policy(root_path, true, mode, &ignored_error);
-        }
-    }
     impl_->reindex_async_fn(impl_->runtime);
 }
 void RuntimeClient::wait_for_idle() {
@@ -581,10 +439,7 @@ std::vector<such::ui::ResultItem> RuntimeClient::search(
 
         // Filtering can discard rows after runtime ranking. Ask for a wider
         // candidate set when a finite cap was requested.
-        const std::size_t candidate_limit = result_limit == 0
-            ? 0
-            : std::max<std::size_t>(result_limit,
-                  std::min<std::size_t>(result_limit > 512u ? 4096u : result_limit * 8u, 4096u));
+        const std::size_t candidate_limit = 0; // Filter before the final result cap.
         if (impl_->search_fn(impl_->runtime, runtime_query.c_str(), raw_dialect, candidate_limit, append_result, &raw) == 0) {
             const std::string abi = impl_->abi_error();
             impl_->error = abi.empty() ? "Such private runtime search failed" : abi;
@@ -609,6 +464,7 @@ std::vector<such::ui::ResultItem> RuntimeClient::search(
         std::vector<such::ui::ResultItem> out;
         out.reserve(raw.size());
         for (auto& item : raw) {
+            if (!searchable_filename(item.filename, item.extension)) continue;
             if (filter.pinned_only && !item.pinned) continue;
             if (!wanted_extensions.empty()) {
                 std::string ext = item.extension;
@@ -645,6 +501,11 @@ std::vector<such::ui::ResultItem> RuntimeClient::search(
                               std::vector<std::uint64_t> candidate_ids,
                               bool candidate_set_is_restrictive,
                               std::string* local_error) {
+        if (impl_->read_only) {
+            impl_->error = "Document contents are still indexing. Filename search is available.";
+            if (local_error != nullptr) *local_error = impl_->error;
+            return std::vector<such::ui::ResultItem>{};
+        }
         if (impl_->search_content_fn == nullptr) {
             impl_->error = "Such /inside requires a content-search capable private runtime (v0.7.0 or newer)";
             if (local_error != nullptr) *local_error = impl_->error;
@@ -682,16 +543,28 @@ std::vector<such::ui::ResultItem> RuntimeClient::search(
                     return std::vector<such::ui::ResultItem>{};
                 }
                 candidate_ids.reserve(candidates.size());
-                for (const auto& item : candidates) candidate_ids.push_back(item.file_id);
+                for (const auto& item : candidates) {
+                    if (item.indexed && searchable_text_filename(item.filename, item.extension)) {
+                        candidate_ids.push_back(item.file_id);
+                    }
+                }
+                if (candidate_ids.empty()) {
+                    impl_->error.clear();
+                    if (local_error != nullptr) local_error->clear();
+                    return std::vector<such::ui::ResultItem>{};
+                }
                 candidate_set_is_restrictive = true;
             }
         }
 
         such_runtime_content_search_request_v1 request{};
-        request.query_utf8 = filter.text.c_str();
+        // Native IMEs can commit canonically decomposed Hangul jamo. Compose
+        // only the content query; do not rewrite user-visible edit control text.
+        const std::string content_query = such::ui::compose_hangul_query_nfc(filter.text);
+        request.query_utf8 = content_query.c_str();
         request.candidate_file_ids = candidate_set_is_restrictive ? candidate_ids.data() : nullptr;
         request.candidate_file_count = candidate_set_is_restrictive ? candidate_ids.size() : 0;
-        request.max_results = max_results;
+        request.max_results = 0; // Prevent rejected suffixes from consuming valid hit slots.
         request.flags = 0;
 
         std::vector<such::ui::ResultItem> out;
@@ -701,6 +574,10 @@ std::vector<such::ui::ResultItem> RuntimeClient::search(
             if (local_error != nullptr) *local_error = impl_->error;
             return std::vector<such::ui::ResultItem>{};
         }
+        out.erase(std::remove_if(out.begin(), out.end(), [](const auto& item) {
+            return !searchable_text_filename(item.filename, item.extension);
+        }), out.end());
+        if (max_results != 0 && out.size() > max_results) out.resize(max_results);
         impl_->error.clear();
         if (local_error != nullptr) local_error->clear();
         return out;
@@ -752,7 +629,16 @@ std::vector<such::ui::ResultItem> RuntimeClient::search(
                     return {};
                 }
                 candidate_ids.reserve(candidates.size());
-                for (const auto& item : candidates) candidate_ids.push_back(item.file_id);
+                for (const auto& item : candidates) {
+                    if (item.indexed && searchable_text_filename(item.filename, item.extension)) {
+                        candidate_ids.push_back(item.file_id);
+                    }
+                }
+                if (candidate_ids.empty()) {
+                    impl_->error.clear();
+                    if (error != nullptr) error->clear();
+                    return {};
+                }
                 restricted = true;
             }
             const auto content_filter = such::ui::parse_search_query(stages[content_stage], dialect, now, observed);
@@ -795,6 +681,8 @@ bool RuntimeClient::set_indexed(std::string_view utf8_path, bool indexed, std::s
 
 RuntimeStatus RuntimeClient::status() const {
     RuntimeStatus out;
+    // Capture asynchronous crawl failures before roots() can clear ABI error state.
+    out.last_error = impl_->runtime_error();
     std::string roots_error;
     out.roots = roots(&roots_error);
     if (!roots_error.empty()) out.last_error = roots_error;
@@ -810,6 +698,9 @@ RuntimeStatus RuntimeClient::status() const {
     out.indexing = raw.indexing != 0;
     out.indexed_files = static_cast<std::size_t>(raw.indexed_files);
     out.generation = raw.generation;
+    // status_v1_fn reports asynchronous worker errors through the ABI error slot.
+    const auto status_error = impl_->abi_error();
+    if (!status_error.empty()) out.last_error = status_error;
     return out;
 }
 

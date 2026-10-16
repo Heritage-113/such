@@ -41,7 +41,7 @@ struct RuntimeEngineStats {
 
 class RuntimeClient final {
 public:
-    explicit RuntimeClient(std::filesystem::path state_directory = {});
+    explicit RuntimeClient(std::filesystem::path state_directory = {}, bool read_only = false);
     ~RuntimeClient();
 
     RuntimeClient(const RuntimeClient&) = delete;
@@ -50,12 +50,13 @@ public:
     RuntimeClient& operator=(RuntimeClient&&) = delete;
 
     [[nodiscard]] bool load(std::string* error = nullptr);
+    void unload() noexcept;
     [[nodiscard]] bool available() const noexcept;
     [[nodiscard]] std::string last_error() const;
 
-    // Root mutations are indexing boundaries: the production runtime schedules
-    // its asynchronous crawl as part of add/replace. Frontends must not call
-    // reindex_async() immediately afterward; use it only for an explicit rebuild.
+    // Raw ABI root mutations. Public path policy belongs to IndexRootService.
+    // The production runtime schedules its asynchronous crawl as part of
+    // add/replace; callers must not immediately issue a second reindex.
     [[nodiscard]] bool add_root(const std::filesystem::path& root, std::string* error = nullptr);
     [[nodiscard]] bool remove_root(const std::filesystem::path& root, std::string* error = nullptr);
     [[nodiscard]] bool replace_roots(const std::vector<std::filesystem::path>& roots, std::string* error = nullptr);

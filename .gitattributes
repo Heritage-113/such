@@ -1,0 +1,12 @@
+* text=auto
+*.cmd text eol=crlf
+*.bat text eol=crlf
+*.sh text eol=lf
+*.cpp text eol=lf
+*.h text eol=lf
+*.ps1 text eol=lf
+*.dll -text
+*.so -text
+*.png -text
+*.ico -text
+*.ai -text

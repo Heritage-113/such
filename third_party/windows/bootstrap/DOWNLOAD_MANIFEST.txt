@@ -1,0 +1,9 @@
+CMakeVersion=3.31.12
+CMakeWindowsX64Zip=cmake-3.31.12-windows-x86_64.zip
+CMakeWindowsX64Sha256=0c4baa40f28b3f8225eb3fdf6946c987b4fe901403b4eaf2fbbd9378100aaa0c
+CMakeUrl=https://cmake.org/files/v3.31/cmake-3.31.12-windows-x86_64.zip
+VisualStudioBuildToolsUrl=https://aka.ms/vs/17/release/vs_buildtools.exe
+VisualStudioWorkload=Microsoft.VisualStudio.Workload.VCTools
+VisualStudioX64Component=Microsoft.VisualStudio.Component.VC.Tools.x86.x64
+VisualStudioArm64Component=Microsoft.VisualStudio.Component.VC.Tools.ARM64
+PowerShellHostAuthority=scripts/windows_powershell_assets.txt

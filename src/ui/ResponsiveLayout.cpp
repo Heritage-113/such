@@ -18,8 +18,8 @@ ResponsiveMetrics compute_responsive_metrics(float width_dip, float height_dip) 
     m.bottom_padding = std::clamp(m.height * 0.020f, 10.0f, 18.0f);
     m.search_height = std::clamp(48.0f * soft_scale, 44.0f, 58.0f);
     m.search_to_results_gap = std::clamp(6.0f * soft_scale, 5.0f, 8.0f);
-    m.security_height = std::clamp(22.0f * soft_scale, 20.0f, 26.0f);
-    m.security_to_results_gap = std::clamp(8.0f * soft_scale, 7.0f, 11.0f);
+    m.status_height = std::clamp(22.0f * soft_scale, 20.0f, 26.0f);
+    m.status_to_results_gap = std::clamp(8.0f * soft_scale, 7.0f, 11.0f);
 
     m.row_gap = std::clamp(7.0f * soft_scale, 5.0f, 9.0f);
     m.row_height = std::clamp(64.0f * soft_scale, 54.0f, 74.0f);
@@ -35,8 +35,8 @@ ResponsiveMetrics compute_responsive_metrics(float width_dip, float height_dip) 
     m.swipe_action_width = std::clamp(72.0f * soft_scale, 66.0f, 82.0f);
 
     const float results_top = m.top_padding + m.search_height
-                            + m.search_to_results_gap + m.security_height
-                            + m.security_to_results_gap;
+                            + m.search_to_results_gap + m.status_height
+                            + m.status_to_results_gap;
     const float results_height = std::max(0.0f, m.height - results_top - m.bottom_padding);
     const float stride = m.row_height + m.row_gap;
     m.visible_results = stride > 0.0f
@@ -52,13 +52,13 @@ WindowLayout compute_window_layout(float width_dip, float height_dip) noexcept {
 
     out.search = {m.side_padding, m.top_padding,
                   std::max(1.0f, m.width - m.side_padding * 2.0f), m.search_height};
-    out.security = {
+    out.status = {
         m.side_padding,
         out.search.y + out.search.height + m.search_to_results_gap,
         std::max(1.0f, m.width - m.side_padding * 2.0f),
-        m.security_height,
+        m.status_height,
     };
-    const float results_y = out.security.y + out.security.height + m.security_to_results_gap;
+    const float results_y = out.status.y + out.status.height + m.status_to_results_gap;
     out.results_viewport = {
         m.side_padding,
         results_y,

@@ -1,6 +1,7 @@
 #include <such/ui/AgentLauncher.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <cctype>
 #include <cstdlib>
 #include <filesystem>
@@ -21,6 +22,7 @@ extern char** environ;
 #else
 #include <limits.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #endif
 
@@ -190,9 +192,13 @@ bool spawn_linux_terminal(const std::string& script, std::string* error) {
     };
     for (const auto& candidate : candidates) {
         if (!command_available(candidate.program)) continue;
-        const pid_t pid = ::fork();
-        if (pid < 0) continue;
-        if (pid == 0) {
+        const pid_t launcher = ::fork();
+        if (launcher < 0) continue;
+        if (launcher == 0) {
+            if (::setsid() < 0) _exit(126);
+            const pid_t child = ::fork();
+            if (child < 0) _exit(126);
+            if (child > 0) _exit(0);
             std::vector<char*> argv;
             argv.push_back(const_cast<char*>(candidate.program));
             for (const auto& arg : candidate.args) argv.push_back(const_cast<char*>(arg.c_str()));
@@ -200,7 +206,13 @@ bool spawn_linux_terminal(const std::string& script, std::string* error) {
             ::execvp(candidate.program, argv.data());
             _exit(127);
         }
-        return true;
+        int status = 0;
+        while (::waitpid(launcher, &status, 0) < 0) {
+            if (errno == EINTR) continue;
+            status = -1;
+            break;
+        }
+        if (status >= 0 && WIFEXITED(status) && WEXITSTATUS(status) == 0) return true;
     }
     if (error) *error = "No supported terminal emulator was found.";
     return false;
@@ -257,7 +269,7 @@ bool launch_agent_terminal(AgentKind kind, const std::filesystem::path& working_
     std::wstring command = L"powershell.exe -NoLogo -NoExit -ExecutionPolicy Bypass -Command \"";
     for (const wchar_t c : body) { if (c == L'\"') command += L"`\""; else command.push_back(c); }
     command += L"\"";
-    STARTUPINFOW si{}; si.cb = sizeof(si);
+    STARTUPINFOW si{}; si.cb = static_cast<DWORD>(sizeof(si));
     PROCESS_INFORMATION pi{};
     std::vector<wchar_t> mutable_cmd(command.begin(), command.end()); mutable_cmd.push_back(L'\0');
     const BOOL ok = CreateProcessW(nullptr, mutable_cmd.data(), nullptr, nullptr, FALSE, CREATE_NEW_CONSOLE,

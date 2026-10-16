@@ -1,0 +1,10 @@
+Such Public - Windows-only source package (see VERSION)
+
+Runtime authority for this package:
+  runtime\windows-x64\SuchRuntimePrivate.dll
+
+Compatibility fallback retained:
+  runtime\windows-x64\SuchRuntimePrivate.dll
+
+The existing Windows installation-directory contract is unchanged.
+Linux private-runtime payload is intentionally excluded from this ZIP.

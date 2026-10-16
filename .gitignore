@@ -6,4 +6,14 @@
 .DS_Store
 
 # Such v1.1 ships the approved Windows/Linux runtime artifacts in-repo.
-# Do not ignore /.runtime/.
+# runtime/ stores separately licensed, hash-pinned runtime binaries.
+
+# Built Windows installer binaries and temporary installer output; keep the
+# Inno Setup definition and the PowerShell build entry points tracked.
+/dist/installers/
+/build/installer/
+/Such_v*_Windows_x64_Setup*.exe
+
+# Generated source/release archives
+/Such*.zip
+/Such*.7z

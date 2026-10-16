@@ -1,0 +1,12 @@
+# Such Windows PowerShell host assets
+# Authority for the PowerShell host shim. Update version, asset names, URLs and SHA-256 together.
+PowerShellVersion=7.6.6
+PowerShellX64Zip=PowerShell-7.6.6-win-x64.zip
+PowerShellX64Sha256=02FE458BE20493FBDF43F61EA20610B811EE6C738AB1676C61B9CFCD1A33C860
+PowerShellX64Url=https://github.com/PowerShell/PowerShell/releases/download/v7.6.6/PowerShell-7.6.6-win-x64.zip
+PowerShellArm64Zip=PowerShell-7.6.6-win-arm64.zip
+PowerShellArm64Sha256=BBDE9DDA31D148415ECCB5FBE1638E6400A144187B006E5B3FD8EC2F39D781BE
+PowerShellArm64Url=https://github.com/PowerShell/PowerShell/releases/download/v7.6.6/PowerShell-7.6.6-win-arm64.zip
+PowerShellX86Zip=PowerShell-7.6.6-win-x86.zip
+PowerShellX86Sha256=2B644D9CB695FE221AF212E23F1C38D3310655B37760EF7741B0FA453B32011E
+PowerShellX86Url=https://github.com/PowerShell/PowerShell/releases/download/v7.6.6/PowerShell-7.6.6-win-x86.zip

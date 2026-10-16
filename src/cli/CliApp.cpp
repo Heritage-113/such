@@ -3,6 +3,9 @@
 #include <such/Version.h>
 #include <such/cli/ProcessControl.h>
 #include <such/runtime/RuntimeClient.h>
+#include <such/runtime/IndexRootService.h>
+#include <such/runtime/DailyIndexRefresh.h>
+#include <such/runtime/IndexSnapshot.h>
 #include <such/ui/FontSettings.h>
 #include <such/ui/FrontendLease.h>
 #include <such/ui/IndexCommands.h>
@@ -10,8 +13,11 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <iostream>
+#include <fstream>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -49,7 +55,11 @@ void print_help() {
         "  such root             list search roots\n"
         "  such root <folder>    use one root\n"
         "  such root + <folder>  add a root\n"
+        "  such drive <folder>   choose one search folder\n"
         "  such scan             rebuild index\n"
+        "  such snapshot export <file.sidx>  export reusable index state\n"
+        "  such snapshot import <file.sidx>  import without full recrawl\n"
+        "  such snapshot info <file.sidx>    inspect snapshot metadata\n"
         "  such status           show index status\n"
         "  such pin <file>       pin a file\n"
         "  such unpin <file>     unpin a file\n"
@@ -59,6 +69,7 @@ void print_help() {
         "  such stop [--force]   stop Such processes\n"
         "  such version          print version\n"
         "\n"
+        "Search box: /drive <folder> on Windows, //drive <folder> on Linux\n"
         "Aliases: roots/use/add, find/search, drive, index, reindex, shutdown\n",
         static_cast<int>(such::version::kVersion.size()), such::version::kVersion.data());
 }
@@ -104,6 +115,119 @@ std::vector<std::string> split_interactive_command(std::string_view line) {
     return arguments;
 }
 
+
+int hex_digit(char value) noexcept {
+    if (value >= '0' && value <= '9') return value - '0';
+    if (value >= 'a' && value <= 'f') return 10 + value - 'a';
+    if (value >= 'A' && value <= 'F') return 10 + value - 'A';
+    return -1;
+}
+
+std::optional<std::filesystem::path> decode_index_worker_path(std::string_view encoded) {
+    if ((encoded.size() % 2u) != 0u) return std::nullopt;
+    std::u8string utf8;
+    utf8.reserve(encoded.size() / 2u);
+    for (std::size_t i = 0; i < encoded.size(); i += 2u) {
+        const int high = hex_digit(encoded[i]);
+        const int low = hex_digit(encoded[i + 1u]);
+        if (high < 0 || low < 0) return std::nullopt;
+        utf8.push_back(static_cast<char8_t>((high << 4) | low));
+    }
+    return std::filesystem::path(utf8);
+}
+
+bool set_index_shard_mode(std::string_view mode) {
+    if (mode != "auto" && mode != "1" && mode != "2" && mode != "4" && mode != "8" && mode != "16") return false;
+    const std::string value(mode);
+#if defined(_WIN32)
+    return _putenv_s("SUCH_INDEX_SHARDS", value.c_str()) == 0;
+#else
+    return ::setenv("SUCH_INDEX_SHARDS", value.c_str(), 1) == 0;
+#endif
+}
+
+int run_index_worker(int argc, char* const* argv, such::ui::PlatformDialect dialect) {
+    if (argc < 3 || argv[2] == nullptr) return 2;
+    const std::string operation = lower_ascii(argv[2]);
+
+    std::vector<std::filesystem::path> roots;
+    roots.reserve(argc > 3 ? static_cast<std::size_t>(argc - 3) : 0u);
+    std::filesystem::path diagnostic_path;
+    bool shard_option_seen = false;
+    for (int i = 3; i < argc; ++i) {
+        const std::string_view token = argv[i] ? std::string_view(argv[i]) : std::string_view{};
+        if (token.starts_with("--diagnostic=")) {
+            const auto decoded = decode_index_worker_path(token.substr(13));
+            if (!decoded || !diagnostic_path.empty()) return 2;
+            diagnostic_path = *decoded;
+            continue;
+        }
+        if (token.starts_with("--shards=")) {
+            if (shard_option_seen || !set_index_shard_mode(token.substr(9))) return 2;
+            shard_option_seen = true;
+            continue;
+        }
+        const auto decoded = decode_index_worker_path(argv[i] ? std::string_view(argv[i]) : std::string_view{});
+        if (!decoded.has_value()) return 2;
+        roots.push_back(*decoded);
+    }
+
+    if (operation == "reindex" && !roots.empty()) return 2;
+    if (operation == "add" && roots.size() != 1u) return 2;
+    if (operation != "reindex" && operation != "add" && operation != "replace") return 2;
+
+    std::ofstream diagnostic;
+    if (!diagnostic_path.empty()) diagnostic.open(diagnostic_path, std::ios::trunc);
+    const auto fail = [&](int code, const std::string& message) {
+        std::fprintf(stderr, "%s\n", message.c_str());
+        if (diagnostic) { diagnostic << message << '\n'; diagnostic.flush(); }
+        return code;
+    };
+#if defined(_WIN32)
+    _putenv_s("SUCH_INDEX_CONTINUE_ON_DOCUMENT_ERROR", "1");
+#else
+    ::setenv("SUCH_INDEX_CONTINUE_ON_DOCUMENT_ERROR", "1", 1);
+#endif
+    such::runtime::RuntimeClient runtime;
+    std::string runtime_error;
+    if (!runtime.load(&runtime_error)) return fail(5, "Index load failed: " + runtime_error);
+
+    // Worker owns every operation that can start a disk crawl. The GUI keeps a
+    // separate read/search handle and never executes root mutation or reindexing
+    // in-process.
+    such::runtime::IndexRootService root_service(runtime, dialect, true);
+    bool ok = false;
+    if (operation == "reindex") ok = root_service.reindex_async(&runtime_error);
+    else if (operation == "add") ok = root_service.add_root(roots.front(), &runtime_error);
+    else ok = root_service.replace_roots(roots, &runtime_error);
+    if (!ok) return fail(6, "Index request failed: " + runtime_error);
+
+    runtime.wait_for_idle();
+    const auto crawl_status = runtime.status();
+    if (crawl_status.indexing || !crawl_status.last_error.empty()) {
+        return fail(8, "Index crawl failed: " + crawl_status.last_error);
+    }
+
+    // Root policy maintenance is also worker-owned. It is bounded per poll, so
+    // drain it after the crawl while keeping all index-side work outside the GUI.
+    constexpr std::size_t kMaintenancePollLimit = 4096u;
+    std::size_t polls = 0;
+    while (root_service.policy_maintenance_active() && polls < kMaintenancePollLimit) {
+        root_service.poll_policy_maintenance();
+        if (runtime.status().indexing) runtime.wait_for_idle();
+        ++polls;
+    }
+    if (root_service.policy_maintenance_active()) return fail(7, "Index folder policy maintenance did not finish.");
+    const auto final_status = runtime.status();
+    if (final_status.indexing || !final_status.last_error.empty()) {
+        return fail(8, "Index worker did not reach a readable idle state: " + final_status.last_error);
+    }
+    // Completion publication is still the Private Runtime's responsibility.
+    // ABI v1 has no explicit transaction-commit receipt; worker exit and a
+    // reloadable view are necessary checks, not proof of a durable commit.
+    return 0;
+}
+
 int run_interactive(such::ui::PlatformDialect dialect) {
     print_help();
     std::string line;
@@ -143,21 +267,24 @@ int run_legacy_index_command(
     std::string& runtime_error) {
     const auto command = such::ui::parse_index_command(raw, dialect);
     if (!command.matched) return -1;
+    if (command.kind == such::ui::IndexCommandKind::Reindex && command.argument && !set_index_shard_mode(*command.argument)) return 2;
+    such::runtime::IndexRootService root_service(runtime, dialect, false);
     switch (command.kind) {
         case such::ui::IndexCommandKind::AddRoot:
             if (!command.argument) { std::fprintf(stderr, "usage: such add <folder>\n"); return 2; }
-            if (!runtime.add_root(*command.argument, &runtime_error)) return print_runtime_error("add root failed", runtime_error, 6);
+            if (!root_service.add_root(*command.argument, &runtime_error)) return print_runtime_error("add root failed", runtime_error, 6);
             runtime.wait_for_idle();
             std::printf("files=%zu\n", runtime.status().indexed_files);
             return 0;
         case such::ui::IndexCommandKind::ReplaceRoot:
             if (!command.argument) { std::fprintf(stderr, "usage: such use <folder>\n"); return 2; }
-            if (!runtime.replace_roots({std::filesystem::path(*command.argument)}, &runtime_error)) return print_runtime_error("use root failed", runtime_error, 6);
+            if (!root_service.replace_roots({std::filesystem::path(*command.argument)}, &runtime_error)) return print_runtime_error("use root failed", runtime_error, 6);
             runtime.wait_for_idle();
             std::printf("files=%zu\n", runtime.status().indexed_files);
             return 0;
         case such::ui::IndexCommandKind::Reindex:
-            runtime.reindex_async();
+            if (!root_service.reindex_async(&runtime_error))
+                return print_runtime_error("reindex failed", runtime_error, 6);
             runtime.wait_for_idle();
             std::printf("files=%zu\n", runtime.status().indexed_files);
             return 0;
@@ -190,6 +317,8 @@ int run(int argc, char* const* argv, such::ui::PlatformDialect dialect) {
 
     const std::string first_raw = argv[1] ? argv[1] : "";
     const std::string first = lower_ascii(first_raw);
+
+    if (first == "--index-worker") return run_index_worker(argc, argv, dialect);
 
     if (is_verb(first, {"help", "--help", "-h"})) { print_help(); return 0; }
     if (is_verb(first, {"version", "--version", "-v"})) {
@@ -263,9 +392,101 @@ int run(int argc, char* const* argv, such::ui::PlatformDialect dialect) {
         return 23;
     }
 
+    if (first == "snapshot") {
+        if (argc != 4 || argv[2] == nullptr || argv[3] == nullptr) {
+            std::fprintf(stderr, "usage: such snapshot <export|import|info> <file.sidx>\n");
+            return 2;
+        }
+        const std::string action = lower_ascii(argv[2]);
+        const std::filesystem::path snapshot_path(argv[3]);
+        std::string snapshot_error;
+        if (action == "info") {
+            such::runtime::IndexSnapshotInfo info;
+            if (!such::runtime::inspect_index_snapshot(snapshot_path, &info, &snapshot_error))
+                return print_runtime_error("snapshot inspect failed", snapshot_error, 10);
+            std::printf("format=%u\ngeneration=%llu\nfiles=%u\nbytes=%llu\nroots=%zu\n",
+                info.format_version,
+                static_cast<unsigned long long>(info.generation),
+                info.file_count,
+                static_cast<unsigned long long>(info.payload_bytes),
+                info.roots.size());
+            for (const auto& root : info.roots) std::printf("root=%s\n", root.string().c_str());
+            return 0;
+        }
+
+        const auto state_directory = such::runtime::index_state_directory(&snapshot_error);
+        if (state_directory.empty()) return print_runtime_error("snapshot state resolution failed", snapshot_error, 10);
+
+        if (action == "export") {
+            std::vector<std::filesystem::path> roots;
+            std::uint64_t generation = 0;
+            {
+                such::runtime::RuntimeClient snapshot_runtime;
+                if (!snapshot_runtime.load(&snapshot_error))
+                    return print_runtime_error("snapshot runtime load failed", snapshot_error, 5);
+                auto status = snapshot_runtime.status();
+                if (status.indexing) {
+                    snapshot_runtime.wait_for_idle();
+                    status = snapshot_runtime.status();
+                }
+                const auto runtime_roots = snapshot_runtime.roots(&snapshot_error);
+                if (!snapshot_error.empty())
+                    return print_runtime_error("snapshot root query failed", snapshot_error, 6);
+                roots.reserve(runtime_roots.size());
+                for (const auto& root : runtime_roots) roots.emplace_back(root);
+                generation = status.generation;
+            }
+            such::runtime::IndexSnapshotInfo info;
+            if (!such::runtime::export_index_snapshot(
+                    state_directory, snapshot_path, roots, generation, &info, &snapshot_error))
+                return print_runtime_error("snapshot export failed", snapshot_error, 10);
+            std::printf("snapshot=%s\ngeneration=%llu\nfiles=%u\nbytes=%llu\n",
+                snapshot_path.string().c_str(),
+                static_cast<unsigned long long>(info.generation),
+                info.file_count,
+                static_cast<unsigned long long>(info.payload_bytes));
+            return 0;
+        }
+
+        if (action == "import") {
+            such::runtime::IndexSnapshotInfo info;
+            if (!such::runtime::import_index_snapshot(
+                    snapshot_path, state_directory, &info, &snapshot_error))
+                return print_runtime_error("snapshot import failed", snapshot_error, 10);
+
+            such::runtime::RuntimeClient imported_runtime;
+            if (!imported_runtime.load(&snapshot_error))
+                return print_runtime_error("imported snapshot runtime load failed", snapshot_error, 5);
+            const auto imported_roots = imported_runtime.roots(&snapshot_error);
+            if (!snapshot_error.empty())
+                return print_runtime_error("imported snapshot root verification failed", snapshot_error, 6);
+            if (imported_roots.size() != info.roots.size()) {
+                std::fprintf(stderr, "snapshot import verification failed: root count mismatch\n");
+                return 10;
+            }
+            for (std::size_t i = 0; i < imported_roots.size(); ++i) {
+                if (std::filesystem::path(imported_roots[i]).lexically_normal() != info.roots[i].lexically_normal()) {
+                    std::fprintf(stderr, "snapshot import verification failed: root mismatch\n");
+                    return 10;
+                }
+            }
+            const auto status = imported_runtime.status();
+            std::printf("snapshot=%s\ngeneration=%llu\nfiles=%zu\nroots=%zu\n",
+                snapshot_path.string().c_str(),
+                static_cast<unsigned long long>(status.generation),
+                status.indexed_files,
+                imported_roots.size());
+            return 0;
+        }
+
+        std::fprintf(stderr, "usage: such snapshot <export|import|info> <file.sidx>\n");
+        return 2;
+    }
+
     such::runtime::RuntimeClient runtime;
     std::string runtime_error;
     if (!runtime.load(&runtime_error)) return print_runtime_error("runtime load failed", runtime_error, 5);
+    such::runtime::IndexRootService root_service(runtime, dialect, false);
 
     if (first == "root") {
         if (argc == 2) {
@@ -279,8 +500,8 @@ int run(int argc, char* const* argv, such::ui::PlatformDialect dialect) {
         const std::string root_path = join_args(argc, argv, path_start);
         if (root_path.empty()) { std::fprintf(stderr, "usage: such root [ + ] <folder>\n"); return 2; }
         const bool ok = add
-            ? runtime.add_root(root_path, &runtime_error)
-            : runtime.replace_roots({std::filesystem::path(root_path)}, &runtime_error);
+            ? root_service.add_root(root_path, &runtime_error)
+            : root_service.replace_roots({std::filesystem::path(root_path)}, &runtime_error);
         if (!ok) return print_runtime_error(add ? "add root failed" : "use root failed", runtime_error, 6);
         runtime.wait_for_idle();
         std::printf("files=%zu\n", runtime.status().indexed_files);
@@ -295,22 +516,35 @@ int run(int argc, char* const* argv, such::ui::PlatformDialect dialect) {
     if (is_verb(first, {"use", "drive"})) {
         if (argc < 3) { std::fprintf(stderr, "usage: such use <folder>\n"); return 2; }
         const std::filesystem::path root(join_args(argc, argv, 2));
-        if (!runtime.replace_roots({root}, &runtime_error)) return print_runtime_error("use root failed", runtime_error, 6);
+        if (!root_service.replace_roots({root}, &runtime_error)) return print_runtime_error("use root failed", runtime_error, 6);
         runtime.wait_for_idle();
         std::printf("files=%zu\n", runtime.status().indexed_files);
         return 0;
     }
     if (is_verb(first, {"add", "index"})) {
         if (argc < 3) { std::fprintf(stderr, "usage: such add <folder>\n"); return 2; }
-        if (!runtime.add_root(join_args(argc, argv, 2), &runtime_error)) return print_runtime_error("add root failed", runtime_error, 6);
+        if (!root_service.add_root(join_args(argc, argv, 2), &runtime_error)) return print_runtime_error("add root failed", runtime_error, 6);
         runtime.wait_for_idle();
         std::printf("files=%zu\n", runtime.status().indexed_files);
         return 0;
     }
     if (is_verb(first, {"scan", "reindex"})) {
-        runtime.reindex_async();
+        if (!root_service.reindex_async(&runtime_error))
+            return print_runtime_error("reindex failed", runtime_error, 6);
         runtime.wait_for_idle();
-        std::printf("files=%zu\n", runtime.status().indexed_files);
+        const auto completed = runtime.status();
+        if (completed.indexing || !completed.last_error.empty()) {
+            return print_runtime_error("reindex completion failed", completed.last_error, 8);
+        }
+        such::runtime::DailyIndexRefresh daily_state(such::runtime::DailyIndexRefresh::default_state_file());
+        std::string state_error;
+        if (daily_state.load(&state_error) &&
+            !daily_state.record_success(such::runtime::DailyIndexRefresh::utc_now(), &state_error)) {
+            std::fprintf(stderr, "Daily refresh timestamp not saved: %s\n", state_error.c_str());
+        } else if (!state_error.empty()) {
+            std::fprintf(stderr, "Daily refresh timestamp not loaded: %s\n", state_error.c_str());
+        }
+        std::printf("files=%zu\n", completed.indexed_files);
         return 0;
     }
     if (first == "status") {

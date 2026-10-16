@@ -6,7 +6,10 @@
 #include <cctype>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
+#include <optional>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -25,7 +28,6 @@
 #else
 #include <cerrno>
 #include <csignal>
-#include <filesystem>
 #include <fstream>
 #include <sys/types.h>
 #include <unistd.h>
@@ -34,17 +36,120 @@
 namespace such::cli {
 namespace {
 
-bool is_target_name(const std::string& name) {
 #if defined(_WIN32)
-    auto lower = name;
-    std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) {
-        return static_cast<char>(std::tolower(c));
+bool is_target_name(std::wstring_view name) noexcept {
+    static constexpr std::array<std::wstring_view, 3> targets{{
+        L"Such.exe", L"SuchCLI.exe", L"SuchMCP.exe"
+    }};
+    return std::any_of(targets.begin(), targets.end(), [&](std::wstring_view target) {
+        if (name.size() != target.size()) return false;
+        return CompareStringOrdinal(
+            name.data(), static_cast<int>(name.size()),
+            target.data(), static_cast<int>(target.size()), TRUE) == CSTR_EQUAL;
     });
-    return lower == "such.exe" || lower == "suchcli.exe" || lower == "suchmcp.exe";
-#else
-    return name == "such" || name == "Such" || name == "SuchCLI" || name == "SuchMCP";
-#endif
 }
+
+#else
+bool is_target_name(const std::string& name) {
+    return name == "such" || name == "Such" || name == "SuchCLI" || name == "SuchMCP";
+}
+#endif
+
+#if defined(_WIN32)
+std::filesystem::path current_executable_path() {
+    std::wstring buffer(32768, L'\0');
+    const DWORD length = GetModuleFileNameW(nullptr, buffer.data(), static_cast<DWORD>(buffer.size()));
+    if (length == 0 || static_cast<std::size_t>(length) >= buffer.size()) return {};
+    buffer.resize(static_cast<std::size_t>(length));
+    return std::filesystem::path(buffer).lexically_normal();
+}
+
+std::optional<std::filesystem::path> process_executable_path(HANDLE process) {
+    std::wstring buffer(32768, L'\0');
+    DWORD length = static_cast<DWORD>(buffer.size());
+    if (QueryFullProcessImageNameW(process, 0, buffer.data(), &length) == FALSE || length == 0) {
+        return std::nullopt;
+    }
+    buffer.resize(static_cast<std::size_t>(length));
+    return std::filesystem::path(buffer).lexically_normal();
+}
+
+bool path_equal_or_within_ci(const std::filesystem::path& candidate,
+                             const std::filesystem::path& root) {
+    std::wstring candidate_text = candidate.lexically_normal().wstring();
+    std::wstring root_text = root.lexically_normal().wstring();
+    while (candidate_text.size() > 1u &&
+           (candidate_text.back() == L'\\' || candidate_text.back() == L'/')) candidate_text.pop_back();
+    while (root_text.size() > 1u &&
+           (root_text.back() == L'\\' || root_text.back() == L'/')) root_text.pop_back();
+    if (candidate_text.size() < root_text.size()) return false;
+    if (CompareStringOrdinal(candidate_text.data(), static_cast<int>(root_text.size()),
+                             root_text.data(), static_cast<int>(root_text.size()), TRUE) != CSTR_EQUAL) {
+        return false;
+    }
+    if (candidate_text.size() == root_text.size()) return true;
+    const wchar_t boundary = candidate_text[root_text.size()];
+    return boundary == L'\\' || boundary == L'/';
+}
+
+std::vector<std::filesystem::path> trusted_process_roots() {
+    std::vector<std::filesystem::path> roots;
+    const auto self_path = current_executable_path();
+    if (self_path.empty()) return roots;
+    const auto self_dir = self_path.parent_path();
+    roots.push_back(self_dir);
+    const auto leaf = self_dir.filename().wstring();
+    if (CompareStringOrdinal(leaf.data(), static_cast<int>(leaf.size()),
+                             L"cli", 3, TRUE) == CSTR_EQUAL) {
+        roots.push_back(self_dir.parent_path());
+    }
+    return roots;
+}
+
+bool is_trusted_process_path(const std::filesystem::path& candidate,
+                             const std::vector<std::filesystem::path>& roots) {
+    return std::any_of(roots.begin(), roots.end(), [&](const auto& root) {
+        return path_equal_or_within_ci(candidate, root);
+    });
+}
+
+struct CloseWindowContext {
+    DWORD pid = 0;
+    bool posted = false;
+};
+
+BOOL CALLBACK close_such_window(HWND hwnd, LPARAM value) {
+    auto* context = reinterpret_cast<CloseWindowContext*>(value);
+    if (context == nullptr) return TRUE;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    if (pid == context->pid) {
+        if (PostMessageW(hwnd, WM_CLOSE, 0, 0) != FALSE) context->posted = true;
+    }
+    return TRUE;
+}
+#elif !defined(__APPLE__)
+std::filesystem::path read_proc_executable(pid_t pid) {
+    const std::filesystem::path link = pid == ::getpid()
+        ? std::filesystem::path("/proc/self/exe")
+        : std::filesystem::path("/proc") / std::to_string(pid) / "exe";
+    std::array<char, 4096> buffer{};
+    const ssize_t length = ::readlink(link.c_str(), buffer.data(), buffer.size() - 1u);
+    if (length <= 0) return {};
+    buffer[static_cast<std::size_t>(length)] = '\0';
+    return std::filesystem::path(buffer.data()).lexically_normal();
+}
+
+bool path_equal_or_within(const std::filesystem::path& candidate,
+                          const std::filesystem::path& root) {
+    const auto candidate_text = candidate.lexically_normal().generic_string();
+    auto root_text = root.lexically_normal().generic_string();
+    while (root_text.size() > 1u && root_text.back() == '/') root_text.pop_back();
+    if (candidate_text == root_text) return true;
+    return candidate_text.size() > root_text.size() && candidate_text.starts_with(root_text) &&
+           candidate_text[root_text.size()] == '/';
+}
+#endif
 
 #if !defined(_WIN32)
 bool alive(pid_t pid) noexcept {
@@ -74,39 +179,38 @@ StopResult stop_such_processes(bool force) noexcept {
         return out;
     }
     PROCESSENTRY32W pe{};
-    pe.dwSize = sizeof(pe);
+    pe.dwSize = static_cast<DWORD>(sizeof(pe));
+    const auto trusted_roots = trusted_process_roots();
+    if (trusted_roots.empty()) {
+        CloseHandle(snapshot);
+        out.error = "could not resolve the current Such executable path";
+        return out;
+    }
     std::vector<DWORD> pids;
     if (Process32FirstW(snapshot, &pe)) {
         do {
             if (pe.th32ProcessID == self) continue;
-            char utf8[MAX_PATH * 3]{};
-            const int n = WideCharToMultiByte(CP_UTF8, 0, pe.szExeFile, -1, utf8, static_cast<int>(sizeof(utf8)), nullptr, nullptr);
-            if (n > 0 && is_target_name(utf8)) pids.push_back(pe.th32ProcessID);
+            if (!is_target_name(pe.szExeFile)) continue;
+            HANDLE candidate_process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pe.th32ProcessID);
+            if (candidate_process == nullptr) continue;
+            const auto candidate_path = process_executable_path(candidate_process);
+            CloseHandle(candidate_process);
+            if (candidate_path.has_value() && is_trusted_process_path(*candidate_path, trusted_roots)) {
+                pids.push_back(pe.th32ProcessID);
+            }
         } while (Process32NextW(snapshot, &pe));
     }
     CloseHandle(snapshot);
     out.matched = pids.size();
-
-    struct CloseCtx { DWORD pid; bool posted; };
-    auto close_windows = [](HWND hwnd, LPARAM value) -> BOOL {
-        auto* ctx = reinterpret_cast<CloseCtx*>(value);
-        DWORD pid = 0;
-        GetWindowThreadProcessId(hwnd, &pid);
-        if (pid == ctx->pid) {
-            PostMessageW(hwnd, WM_CLOSE, 0, 0);
-            ctx->posted = true;
-        }
-        return TRUE;
-    };
 
     for (const DWORD pid : pids) {
         HANDLE process = OpenProcess(SYNCHRONIZE | PROCESS_TERMINATE, FALSE, pid);
         if (!process) { ++out.failed; continue; }
         bool terminated = false;
         if (!force) {
-            CloseCtx ctx{pid, false};
-            EnumWindows(close_windows, reinterpret_cast<LPARAM>(&ctx));
-            if (ctx.posted && WaitForSingleObject(process, 1500) == WAIT_OBJECT_0) terminated = true;
+            CloseWindowContext context{pid, false};
+            EnumWindows(close_such_window, reinterpret_cast<LPARAM>(&context));
+            if (context.posted && WaitForSingleObject(process, 1500) == WAIT_OBJECT_0) terminated = true;
         }
         if (!terminated) {
             if (TerminateProcess(process, 0)) {
@@ -140,6 +244,12 @@ StopResult stop_such_processes(bool force) noexcept {
     }
 #else
     const pid_t self = ::getpid();
+    const auto self_executable = read_proc_executable(self);
+    if (self_executable.empty()) {
+        out.error = "could not resolve the current Such executable path";
+        return out;
+    }
+    const auto trusted_root = self_executable.parent_path();
     std::error_code ec;
     for (const auto& entry : std::filesystem::directory_iterator("/proc", ec)) {
         if (ec || !entry.is_directory(ec)) continue;
@@ -152,6 +262,8 @@ StopResult stop_such_processes(bool force) noexcept {
         std::string name;
         std::getline(comm, name);
         if (!is_target_name(name)) continue;
+        const auto candidate_executable = read_proc_executable(pid);
+        if (candidate_executable.empty() || !path_equal_or_within(candidate_executable, trusted_root)) continue;
         ++out.matched;
         const int signal = force ? SIGKILL : SIGTERM;
         if (::kill(pid, signal) != 0) { ++out.failed; continue; }

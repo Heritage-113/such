@@ -8,6 +8,9 @@ param(
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
+. (Join-Path $PSScriptRoot 'windows_paths.ps1')
+$SourceRootForVersion=Get-SuchSourceRoot -ScriptRoot $PSScriptRoot
+$ProductVersion=Get-SuchVersion -SourceRoot $SourceRootForVersion
 
 $localData = [System.Environment]::GetFolderPath([System.Environment+SpecialFolder]::LocalApplicationData)
 if ([string]::IsNullOrWhiteSpace($localData)) {
@@ -201,7 +204,7 @@ try {
   $manifest = [ordered]@{
     schemaVersion = 1
     product       = 'Such'
-    version       = '1.1.7'
+    version       = $ProductVersion
     installedAt   = (Get-Date).ToString('o')
     entries       = @($entries)
   }

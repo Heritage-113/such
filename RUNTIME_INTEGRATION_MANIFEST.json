@@ -1,0 +1,57 @@
+{
+  "date": "2026-10-16",
+  "product": "Such Public v1.3.5 + Private Runtime v0.8.0 Fix5 + Daily/IME/Inside Stage3 candidate",
+  "source_archive": "Such_1.3.5_SourceOnly.zip",
+  "uploaded_windows_file": "SuchRuntimePrivate(3).dll",
+  "uploaded_linux_archive": "SuchRuntimePrivate_v0.8.0_Linux_x64_RuntimeOnly(2).zip",
+  "sha256": {
+    "windows_dll": "f13a1025b1dffb669e847598f95f3b14715598965163c43c67445a88a294e7ca",
+    "linux_so": "cd3dbd1cd1d62f4695c88d56c090134676f06c89e1a79ed2bbdb1a2a0c073552"
+  },
+  "binary_identity_vs_previous_bundle": {
+    "windows": false,
+    "linux": true
+  },
+  "source_modified": true,
+  "runtime_modified": true,
+  "public_abi": 1,
+  "required_abi_exports_count": 19,
+  "abi_symbol_match": {
+    "windows": 19,
+    "linux": 19
+  },
+  "linux_abi_version_runtime_call": 1,
+  "windows_runtime_execution": "13 public tests, 6 private runtime tests, production smoke and 2400-document concurrent filename-search integration passed",
+  "stage1_status": "Stage3 runtime-bundled candidate / Windows qualification not performed",
+  "daily_indexing": "PUBLIC SCHEDULER PATCHED; PRIVATE COMMIT CONFIRMATION UNVERIFIED",
+  "additional_private_inside_policy": "PUBLIC FILTERING ONLY; PRIVATE SOURCE UNAVAILABLE",
+  "github_commit": "Prepared for commit; see Git history",
+  "private_sdk_source_included": false,
+  "license_files_included": true,
+  "linux_legal_notice_included": true,
+  "package_runtime_included": {
+    "windows": true,
+    "linux": true
+  },
+  "windows_verify_install": "UNVERIFIED",
+  "windows_installer": "Inno Setup 7 compilation verified locally; installer excluded from Git",
+  "windows_permission_fix": "Excluded directories pruned before recursion; inaccessible descendants skipped; junctions skipped; read-locked files retain filename metadata without content extraction.",
+  "windows_fast_indexing": {
+    "filename_first": true,
+    "readonly_abi": "such_runtime_create_readonly_v1",
+    "shard_modes": [
+      "auto",
+      "1",
+      "2",
+      "4",
+      "8",
+      "16"
+    ],
+    "automatic_max_shards": 4,
+    "integration_filename_ready_seconds": 0.468,
+    "integration_contents_done_seconds": 13.626,
+    "benchmark_scope": "Synthetic 524288 metadata rows; DB stage only, not full filesystem/content indexing.",
+    "progressive_enumeration_checkpoints": true,
+    "background_skip_document_errors": true
+  }
+}

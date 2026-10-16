@@ -20,11 +20,11 @@ struct ResponsiveMetrics {
     float top_padding = 0.0f;
     float bottom_padding = 0.0f;
     float search_height = 0.0f;
-    // Search remains the only top-level input surface. Security is a compact
-    // secondary control row immediately below it.
+    // Search is the only top-level input. The compact row below it is reserved
+    // for indexing progress, with no interactive security control.
     float search_to_results_gap = 0.0f;
-    float security_height = 0.0f;
-    float security_to_results_gap = 0.0f;
+    float status_height = 0.0f;
+    float status_to_results_gap = 0.0f;
 
     float row_height = 0.0f;
     float row_gap = 0.0f;
@@ -46,7 +46,7 @@ struct ResponsiveMetrics {
 struct WindowLayout {
     ResponsiveMetrics metrics{};
     RectF search{};
-    RectF security{};
+    RectF status{};
     RectF results_viewport{};
 
     // Compatibility preview for the first five rows. New frontend code should

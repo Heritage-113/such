@@ -13,7 +13,9 @@ struct StopResult {
     std::string error;
 };
 
-// Stops only exact Such process basenames and never the calling process.
+// Stops only exact Such process basenames that resolve under the current Such
+// executable root, and never the calling process. This prevents `such stop`
+// from terminating unrelated same-name programs elsewhere on the machine.
 [[nodiscard]] StopResult stop_such_processes(bool force) noexcept;
 
 } // namespace such::cli

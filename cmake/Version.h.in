@@ -6,5 +6,5 @@ namespace such::version {
 inline constexpr std::string_view kVersion = "@PROJECT_VERSION@";
 inline constexpr std::string_view kProductName = "Such";
 inline constexpr std::string_view kDisplayName = "Such v@PROJECT_VERSION@";
-inline constexpr int kBuildNumber = 100;
+inline constexpr wchar_t kWindowClassName[] = L"HeritageSuchV@PROJECT_VERSION_MAJOR@_@PROJECT_VERSION_MINOR@_@PROJECT_VERSION_PATCH@Window";
 } // namespace such::version

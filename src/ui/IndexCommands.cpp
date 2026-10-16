@@ -39,8 +39,15 @@ IndexCommand parse_index_command(std::string_view query, PlatformDialect dialect
     }
     const std::string prefix(operator_prefix(dialect));
     const std::string index_token = prefix + "index";
-    if (value == index_token) return {IndexCommandKind::AddRoot, true, std::nullopt};
+    if (value == index_token) return {
+        dialect == PlatformDialect::Windows ? IndexCommandKind::Reindex : IndexCommandKind::AddRoot,
+        true, std::nullopt};
     if (value.starts_with(index_token + " ")) {
+        const auto mode = trim_lower(std::string_view(value).substr(index_token.size() + 1));
+        if (dialect == PlatformDialect::Windows &&
+            (mode == "auto" || mode == "1" || mode == "2" || mode == "4" || mode == "8" || mode == "16")) {
+            return {IndexCommandKind::Reindex, true, mode};
+        }
         std::string original(query);
         std::size_t first = 0;
         while (first < original.size() && std::isspace(static_cast<unsigned char>(original[first])) != 0) ++first;

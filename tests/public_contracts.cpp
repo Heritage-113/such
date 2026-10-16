@@ -1,10 +1,12 @@
 #include <such/ui/AgentLauncher.h>
 #include <such/ui/DisplayScalePolicy.h>
 #include <such/ui/IndexCommands.h>
+#include <such/ui/CommittedInputGate.h>
+#include <such/ui/HangulQueryNfc.h>
 #include <such/ui/SearchDialect.h>
 #include <such/ui/ResponsiveLayout.h>
-#include <such/security/SecureSearchGate.h>
 #include <such/runtime/IndexPathPolicy.h>
+#include <such/runtime/SearchableFiles.h>
 
 #include <cstdlib>
 #include <filesystem>
@@ -24,6 +26,52 @@ int fail(int code, const char* why) {
 
 int main() {
     using namespace such::ui;
+
+    if (compose_hangul_query_nfc("\xE1\x84\x80\xE1\x85\xA5\xE1\x86\xB7\xE1\x84\x89\xE1\x85\xA2\xE1\x86\xA8") !=
+        "\xEA\xB2\x80\xEC\x83\x89") return fail(78, "Hangul canonical NFC composition");
+    if (compose_hangul_query_nfc("search /inside XYZ") != "search /inside XYZ") return fail(79, "ASCII query unchanged");
+
+    // Native IME feeds transient preedit via EN_CHANGE on Windows; neither
+    // intermediate Hangul nor a duplicate post-commit EN_CHANGE may search.
+    CommittedInputGate<std::u16string> ime;
+    if (!ime.accept(u"/inside ")) return fail(71, "initial committed query");
+    ime.begin_composition();
+    if (ime.accept(u"/inside ㄱ") || ime.accept(u"/inside 거") ||
+        ime.accept(u"/inside 검")) return fail(72, "preedit triggered search");
+    ime.end_composition();
+    if (!ime.accept(u"/inside 검") || ime.accept(u"/inside 검"))
+        return fail(73, "IME commit duplication");
+    ime.begin_composition();
+    if (ime.accept(u"/inside 검ㅅ")) return fail(74, "second preedit triggered search");
+    ime.end_composition();
+    if (!ime.accept(u"/inside 검색") || ime.accept(u"/inside 검색"))
+        return fail(75, "second committed Hangul syllable");
+    if (!ime.accept(u"/inside 검색X") || !ime.accept(u"/inside 검"))
+        return fail(76, "mixed text and backspace");
+    ime.begin_composition();
+    ime.end_composition(); // cancelled composition does not itself dispatch.
+    if (ime.accept(u"/inside 검")) return fail(77, "cancelled IME triggered search");
+
+    if (!such::runtime::searchable_filename("main.cpp", "cpp") ||
+        !such::runtime::searchable_filename("build.rs", "rs") ||
+        !such::runtime::searchable_filename("CMakeLists.txt", "txt") ||
+        !such::runtime::searchable_filename("Makefile", "") ||
+        !such::runtime::searchable_filename(".gitignore", "") ||
+        !such::runtime::searchable_filename("example.DWG", "DWG") ||
+        !such::runtime::searchable_filename("report.pdf", "pdf"))
+        return fail(80, "ordinary and developer files must remain searchable");
+    if (!such::runtime::searchable_text_filename("main.cpp", "cpp") ||
+        !such::runtime::searchable_text_filename("Makefile", "") ||
+        !such::runtime::searchable_text_filename("settings.json", "json") ||
+        such::runtime::searchable_text_filename("report.pdf", "pdf") ||
+        such::runtime::searchable_text_filename("slides.pptx", "pptx") ||
+        such::runtime::searchable_text_filename("image.png", "png") ||
+        such::runtime::searchable_text_filename("mod.so", "so"))
+        return fail(83, "content must be text only");
+    if (such::runtime::searchable_filename("mystery.unknown987", "cpp") ||
+        such::runtime::searchable_filename("internal.whatever", "") ||
+        such::runtime::searchable_filename("blob", ""))
+        return fail(81, "unregistered suffixes must be hidden from search");
 
     const auto w = parse_index_command("/drive X:\\Work", PlatformDialect::Windows);
     if (!w.matched || w.kind != IndexCommandKind::ReplaceRoot || !w.argument.has_value()) return fail(1, "Windows /drive");
@@ -47,6 +95,11 @@ int main() {
 
     const auto filter = parse_search_query("/pdf /week report", PlatformDialect::Windows, 1'800'000'000);
     if (filter.extensions.empty() || filter.text != "report") return fail(3, "legacy filter syntax");
+
+    const std::string korean_query = "\xED\x95\x9C\xEA\xB8\x80 \xEA\xB2\x80\xEC\x83\x89";
+    const auto korean_filter = parse_search_query(korean_query, PlatformDialect::Windows, 1'800'000'000);
+    if (korean_filter.text != korean_query || compile_runtime_query(korean_filter, PlatformDialect::Windows) != korean_query)
+        return fail(40, "UTF-8 Korean query preservation");
 
     // CAD extensions that users expect to find by filename are built in even if
     // an older private runtime has not yet reported them in list_extensions().
@@ -77,6 +130,30 @@ int main() {
     if (!parse_agent_command("/claude", PlatformDialect::Windows).matched) return fail(14, "Claude command");
     if (!parse_agent_command("//codex", PlatformDialect::UnixLike).matched) return fail(15, "Unix Codex command");
     if (!parse_agent_command("//claude", PlatformDialect::UnixLike).matched) return fail(16, "Unix Claude command");
+    for (const auto mode : {"auto", "1", "2", "4", "8", "16"}) {
+        const auto sharded = parse_index_command(std::string("/index ") + mode, PlatformDialect::Windows);
+        if (!sharded.matched || sharded.kind != IndexCommandKind::Reindex || sharded.argument != mode)
+            return fail(52, "index shard mode parsing");
+    }
+    const auto manual_index = parse_index_command(" /INDEX  ", PlatformDialect::Windows);
+    if (!manual_index.matched || manual_index.kind != IndexCommandKind::Reindex || manual_index.argument.has_value())
+        return fail(49, "bare Windows index manually rebuilds current roots");
+    const auto add_index = parse_index_command("/index C:\\Work", PlatformDialect::Windows);
+    if (!add_index.matched || add_index.kind != IndexCommandKind::AddRoot || !add_index.argument.has_value())
+        return fail(50, "index with folder preserves add behavior");
+    const auto index_suggestions = autocomplete("/index", PlatformDialect::Windows, {});
+    if (index_suggestions.size() != 1 || index_suggestions.front().token != "/index")
+        return fail(51, "manual index autocomplete");
+    const auto drive_menu = autocomplete("/", PlatformDialect::Windows, {});
+    bool has_drive = false;
+    for (const auto& suggestion : drive_menu) has_drive = has_drive || suggestion.token == "/drive";
+    if (!has_drive) return fail(41, "Windows slash menu must include folder picker");
+    const auto drive_prefix = autocomplete("/dr", PlatformDialect::Windows, {});
+    if (drive_prefix.size() != 1 || drive_prefix.front().token != "/drive") return fail(42, "Windows drive autocomplete");
+    const auto drive_picker = parse_index_command("/drive", PlatformDialect::Windows);
+    if (!drive_picker.matched || drive_picker.kind != IndexCommandKind::ReplaceRoot || drive_picker.argument.has_value())
+        return fail(43, "Bare drive command opens folder picker");
+    if (!autocomplete("/drive", PlatformDialect::UnixLike, {}).empty()) return fail(44, "Unix drive keeps double slash");
     const auto unix_agent_suggestions = autocomplete("/c", PlatformDialect::UnixLike, {});
     if (unix_agent_suggestions.size() < 2 || unix_agent_suggestions[0].token.empty()) return fail(17, "universal AI autocomplete");
     const auto detail_suggestions = autocomplete("/;", PlatformDialect::UnixLike, {});
@@ -105,6 +182,16 @@ int main() {
         !such::runtime::is_windows_protected_index_path("C:\\Projects\\demo\\node_modules\\pkg") ||
         such::runtime::is_windows_protected_index_path("C:\\Users\\alice\\Documents\\Project") ||
         such::runtime::is_windows_protected_index_path("D:\\Work\\AppDataModel")) return fail(29, "Windows protected index paths");
+    if (!such::runtime::is_windows_such_install_path(
+            "C:\\Users\\alice\\AppData\\Local\\Programs\\Such\\Such.exe") ||
+        !such::runtime::is_windows_protected_index_path(
+            "C:\\Users\\alice\\AppData\\Local\\Programs\\Such\\Such.exe") ||
+        !such::runtime::is_windows_protected_index_path(
+            "C:\\Users\\alice\\AppData\\Local\\Programs\\OtherApp\\cache.bin") ||
+        !such::runtime::is_windows_protected_index_path(
+            "C:\\Users\\alice\\AppData\\Local\\Programs\\Such\\node_modules\\pkg")) {
+        return fail(38, "Windows AppData classification and Such install shape");
+    }
 
     auto policy_parent = std::filesystem::temp_directory_path();
 #if defined(_WIN32)
@@ -133,6 +220,10 @@ int main() {
     std::filesystem::create_directories(policy_root / ".git" / "objects", policy_ec);
     std::filesystem::create_directories(policy_root / "py" / "__pycache__", policy_ec);
     if (policy_ec) return fail(30, "policy fixture setup");
+    const auto bounded_policy = such::runtime::plan_default_index_policy(policy_root);
+    if (!bounded_policy.root_allowed || !bounded_policy.exclusions.empty()) {
+        return fail(39, "bounded policy must be the safe default");
+    }
     const auto policy = such::runtime::plan_default_index_policy(policy_root, true);
     if (!policy.root_allowed || policy.exclusions.size() < 3u) return fail(31, "policy subtree discovery");
     const auto rejected = such::runtime::plan_default_index_policy(policy_root / "node_modules", false);
@@ -140,21 +231,34 @@ int main() {
     std::filesystem::remove_all(policy_root, policy_ec);
 
 
-    if (such::runtime::is_windows_protected_index_path("C:\\Heritage\\Such\\Such.exe"))
-        return fail(33, "C:\\Heritage\\Such must not require a self-exclusion rule");
+#if defined(_WIN32)
+    const auto install_root = such::runtime::windows_such_install_root();
+    if (install_root.empty()) return fail(33, "per-user Such install root resolution");
+    const auto install_policy = such::runtime::plan_default_index_policy(install_root, false);
+    if (!install_policy.root_allowed) return fail(33, "current-user Such install directory carve-out");
+    const auto install_noise = such::runtime::plan_default_index_policy(install_root / L"node_modules", true);
+    if (!install_noise.root_allowed || !install_noise.exclusions.empty()) return fail(45, "install exception outranks noise rules");
+    const auto drive_policy = such::runtime::plan_default_index_policy(install_root.root_path(), false);
+    if (!drive_policy.root_allowed) return fail(46, "whole drive root allowed");
+    auto covers_install = [&](const std::filesystem::path& excluded) {
+        const auto relative = install_root.lexically_relative(excluded);
+        return relative.empty() ? install_root == excluded : *relative.begin() != L"..";
+    };
+    for (const auto& excluded : drive_policy.exclusions) {
+        if (covers_install(excluded)) return fail(47, "drive policy must not mask installed Such");
+    }
+    const auto install_discovery = such::runtime::discover_default_noise_exclusions(install_root);
+    if (!install_discovery.empty()) return fail(48, "installed subtree remains searchable during discovery");
+    const auto sibling_app = install_root.parent_path() / L"OtherApp";
+    const auto sibling_policy = such::runtime::plan_default_index_policy(sibling_app, false);
+    if (sibling_policy.root_allowed) return fail(33, "AppData sibling must remain protected");
+#endif
 
-    const auto security_layout = compute_window_layout(760.0f, 600.0f);
-    if (security_layout.security.y <= security_layout.search.y + security_layout.search.height)
-        return fail(24, "Security row must sit below the search field");
-    if (security_layout.results_viewport.y <= security_layout.security.y + security_layout.security.height)
-        return fail(25, "Results must sit below the Security row");
-
-    such::security::SecureSearchGate security_gate;
-    std::string security_error;
-    if (security_gate.request_enable(security_error) !=
-        such::security::SecureSearchDecision::RequiresEnterpriseActivation)
-        return fail(26, "Security gate must fail closed without Enterprise provider");
-    if (security_gate.active()) return fail(27, "Security gate unexpectedly active");
+    const auto status_layout = compute_window_layout(760.0f, 600.0f);
+    if (status_layout.status.y <= status_layout.search.y + status_layout.search.height)
+        return fail(24, "Status row must sit below the search field");
+    if (status_layout.results_viewport.y <= status_layout.status.y + status_layout.status.height)
+        return fail(25, "Results must sit below the Status row");
 
     DisplayScaleInput linux_4k{};
     linux_4k.dpi = 96.0f; // common synthetic X11 value even on a 4K panel

@@ -1,9 +1,11 @@
 #include <such/Version.h>
 #include <such/runtime/RuntimeClient.h>
-#include <such/security/SecureSearchGate.h>
+#include <such/runtime/IndexWorkerLauncher.h>
+#include <such/runtime/DailyIndexRefresh.h>
 #include <such/ui/DesignContract.h>
 #include <such/ui/AgentLauncher.h>
 #include <such/ui/IndexCommands.h>
+#include <such/ui/CommittedInputGate.h>
 #include <such/ui/FrontendLease.h>
 #include <such/ui/FontSettings.h>
 #include <such/ui/ResponsiveLayout.h>
@@ -19,10 +21,14 @@
 #include <commctrl.h>
 #include <shellapi.h>
 #include <shlobj.h>
+#include <shobjidl.h>
+#include <gdiplus.h>
+#include <fstream>
 
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstdio>
 #include <cmath>
 #include <cstdint>
 #include <cwchar>
@@ -41,14 +47,13 @@ namespace {
 using such::ui::ResultAction;
 using such::ui::SwipeSide;
 
-constexpr wchar_t kClassName[] = L"HeritageSuchV110Window";
 constexpr wchar_t kSearchClass[] = L"EDIT";
 constexpr UINT kMsgAutocomplete = WM_APP + 1;
 constexpr UINT kMsgCloseTransient = WM_APP + 2;
 constexpr UINT kMsgOpenSelected = WM_APP + 3;
 constexpr UINT kMsgEnsureIndexRoot = WM_APP + 4;
+constexpr UINT kMsgRefreshAfterIme = WM_APP + 5;
 constexpr UINT_PTR kTimerRuntimeRefresh = 3;
-constexpr UINT_PTR kTimerSearchDebounce = 4;
 
 constexpr float kSearchLeftContentInsetDip = 39.0f;
 constexpr float kSearchRightContentInsetDip = 44.0f;
@@ -82,7 +87,6 @@ constexpr int kMenuIconFolder = 3202;
 constexpr int kMenuIconFavorite = 3203;
 
 HWND gSearch = nullptr;
-WNDPROC gOldSearchProc = nullptr;
 HFONT gSearchFont = nullptr;
 HFONT gFilenameFont = nullptr;
 HFONT gPathFont = nullptr;
@@ -96,11 +100,20 @@ std::unordered_map<std::wstring, HICON> gIconCache;
 std::wstring gQuery;
 std::vector<such::ui::ResultItem> gResults;
 std::string gSearchError;
+std::string gIndexWorkerFailure;
 std::unique_ptr<such::runtime::RuntimeClient> gRuntime;
-such::security::SecureSearchGate gSecurityGate;
 std::uint64_t gRuntimeGeneration = 0;
 std::size_t gRuntimeIndexedFiles = 0;
 bool gRuntimeIndexing = false;
+ULONGLONG gIndexProgressStarted = 0;
+ULONGLONG gIndexProgressCompleted = 0;
+bool gStartupReindexNeeded = false;
+bool gSearchImeComposing = false;
+such::ui::CommittedInputGate<std::wstring> gSearchInputGate;
+such::runtime::IndexWorkerTicket gIndexWorker{};
+std::string gIndexWorkerAction;
+such::runtime::DailyIndexRefresh gDailyRefresh(such::runtime::DailyIndexRefresh::default_state_file());
+bool gDailyRefreshReady = false;
 float gScrollDip = 0.0f;
 std::vector<such::ui::Suggestion> gSuggestions;
 bool gDemo = false;
@@ -282,17 +295,19 @@ void stroke_round(HDC dc, const RECT& rect, int radius, COLORREF color, int widt
     DeleteObject(pen);
 }
 
+// Matches assets/icon/search.svg in a 24 x 24 view box.
 void draw_search_glyph(HDC dc, int cx, int cy, int size, COLORREF color = kDarkGreen) {
-    HPEN pen = CreatePen(PS_SOLID, std::max(1, size / 8), color);
-    const HGDIOBJ oldPen = SelectObject(dc, pen);
-    const HGDIOBJ oldBrush = SelectObject(dc, GetStockObject(HOLLOW_BRUSH));
-    const int r = size / 3;
-    Ellipse(dc, cx - r, cy - r, cx + r, cy + r);
-    MoveToEx(dc, cx + r - 1, cy + r - 1, nullptr);
-    LineTo(dc, cx + size / 2, cy + size / 2);
-    SelectObject(dc, oldBrush);
-    SelectObject(dc, oldPen);
-    DeleteObject(pen);
+    Gdiplus::Graphics graphics(dc);
+    graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+    const float unit = static_cast<float>(size) / 24.0f;
+    graphics.TranslateTransform(static_cast<float>(cx) - size * 0.5f,
+                                static_cast<float>(cy) - size * 0.5f);
+    graphics.ScaleTransform(unit, unit);
+    Gdiplus::Pen pen(Gdiplus::Color(255, GetRValue(color), GetGValue(color), GetBValue(color)), 1.8f);
+    pen.SetStartCap(Gdiplus::LineCapRound);
+    pen.SetEndCap(Gdiplus::LineCapRound);
+    graphics.DrawEllipse(&pen, 3.5f, 3.5f, 13.0f, 13.0f);
+    graphics.DrawLine(&pen, 14.6f, 14.6f, 20.5f, 20.5f);
 }
 
 void draw_pin_mark(HDC dc, int x, int y, int size) {
@@ -725,9 +740,48 @@ void update_scrollbar(HWND hwnd);
 void refresh_query(HWND hwnd, bool resetScroll);
 
 std::optional<std::filesystem::path> choose_index_root(HWND hwnd) {
+    // Use the modern shell picker. Unlike the legacy SHBrowseForFolder path,
+    // IFileOpenDialog reliably exposes drive roots under This PC and returns a
+    // filesystem path for both folders and whole-volume roots.
+    IFileOpenDialog* dialog = nullptr;
+    const HRESULT created = CoCreateInstance(
+        CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER,
+        IID_PPV_ARGS(&dialog));
+    if (SUCCEEDED(created) && dialog != nullptr) {
+        DWORD options = 0;
+        if (SUCCEEDED(dialog->GetOptions(&options))) {
+            dialog->SetOptions(options | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST);
+        }
+        dialog->SetTitle(L"Choose a drive or folder for Such to search");
+        const HRESULT shown = dialog->Show(hwnd);
+        if (shown == HRESULT_FROM_WIN32(ERROR_CANCELLED)) {
+            dialog->Release();
+            return std::nullopt;
+        }
+        if (SUCCEEDED(shown)) {
+            IShellItem* item = nullptr;
+            if (SUCCEEDED(dialog->GetResult(&item)) && item != nullptr) {
+                PWSTR value = nullptr;
+                const HRESULT named = item->GetDisplayName(SIGDN_FILESYSPATH, &value);
+                item->Release();
+                if (SUCCEEDED(named) && value != nullptr) {
+                    std::filesystem::path selected(value);
+                    CoTaskMemFree(value);
+                    dialog->Release();
+                    return selected;
+                }
+                if (value != nullptr) CoTaskMemFree(value);
+            }
+        }
+        dialog->Release();
+    }
+
+    // Conservative fallback for shell environments where FileOpenDialog is
+    // unavailable. This path remains filesystem-only and can still select a
+    // volume root.
     BROWSEINFOW browse{};
     browse.hwndOwner = hwnd;
-    browse.lpszTitle = L"Choose a folder for Such to index";
+    browse.lpszTitle = L"Choose a drive or folder for Such to search";
     browse.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE | BIF_USENEWUI;
     PIDLIST_ABSOLUTE pidl = SHBrowseForFolderW(&browse);
     if (!pidl) return std::nullopt;
@@ -739,17 +793,141 @@ std::optional<std::filesystem::path> choose_index_root(HWND hwnd) {
     return std::filesystem::path(buffer);
 }
 
+bool reload_runtime_after_index_worker(HWND hwnd, int worker_exit_code) {
+    gRuntime.reset();
+    auto replacement = std::make_unique<such::runtime::RuntimeClient>(std::filesystem::path{}, worker_exit_code != 0);
+    std::string runtime_error;
+    if (!replacement->load(&runtime_error)) {
+        gSearchError = "Could not reload Such index after background worker: " + runtime_error;
+        gRuntimeIndexing = false;
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return false;
+    }
+
+    gRuntime = std::move(replacement);
+    const auto status = gRuntime->status();
+    gRuntimeGeneration = status.generation;
+    gRuntimeIndexedFiles = status.indexed_files;
+    gRuntimeIndexing = false;
+    if (worker_exit_code == 0 && !status.indexing && status.last_error.empty()) {
+        gSearchError.clear();
+        // A successful worker plus a loadable published index is the strongest
+        // available Public ABI v1 signal; Private commit receipt remains pending.
+        if (gDailyRefreshReady) {
+            std::string persist_error;
+            if (!gDailyRefresh.record_success(such::runtime::DailyIndexRefresh::utc_now(), &persist_error)) {
+                gSearchError = "Daily index refresh state: " + persist_error;
+            }
+        }
+    } else {
+        gSearchError = !status.last_error.empty() ? status.last_error :
+            "Background indexing failed (worker exit " + std::to_string(worker_exit_code) + ").";
+        if (!gIndexWorker.diagnostic_path.empty()) {
+            std::ifstream diagnostic(gIndexWorker.diagnostic_path);
+            std::string message;
+            if (std::getline(diagnostic, message) && !message.empty()) {
+                gSearchError += " " + message.substr(0, 2048);
+            }
+        }
+        if (gDailyRefreshReady) {
+            std::string persist_error;
+            if (!gDailyRefresh.record_failure(such::runtime::DailyIndexRefresh::utc_now(), &persist_error)) {
+                gSearchError += " (Could not persist retry time: " + persist_error + ")";
+            }
+        }
+    }
+    gIndexWorkerFailure = gSearchError;
+    refresh_query(hwnd, false);
+    if (gSearch) InvalidateRect(gSearch, nullptr, TRUE);
+    InvalidateRect(hwnd, nullptr, FALSE);
+    return worker_exit_code == 0 && !status.indexing && status.last_error.empty();
+}
+
+bool poll_index_worker_and_reload(HWND hwnd) {
+    if (!gIndexWorker.valid()) return false;
+    int exit_code = 0;
+    const auto state = such::runtime::poll_index_worker(&gIndexWorker, &exit_code);
+    if (state == such::runtime::IndexWorkerPoll::Running) {
+        if (!gRuntimeIndexing) {
+            gRuntimeIndexing = true;
+            if (gSearch) InvalidateRect(gSearch, nullptr, TRUE);
+            InvalidateRect(hwnd, nullptr, FALSE);
+        }
+        return false;
+    }
+    const std::string action = gIndexWorkerAction;
+    gIndexWorkerAction.clear();
+    const bool completed = reload_runtime_after_index_worker(hwnd, exit_code);
+    gIndexProgressCompleted = completed ? GetTickCount64() : 0;
+    gIndexProgressStarted = 0;
+    if (state == such::runtime::IndexWorkerPoll::Failed && gSearchError.empty()) {
+        gSearchError = action.empty() ? "Background indexing failed." : action + " failed.";
+    }
+    return true;
+}
+
+bool start_index_worker(HWND hwnd, const such::runtime::IndexWorkerRequest& request, std::string_view action) {
+    if (gIndexWorker.valid()) {
+        int exit_code = 0;
+        const auto state = such::runtime::poll_index_worker(&gIndexWorker, &exit_code);
+        if (state == such::runtime::IndexWorkerPoll::Running) {
+            // Keep search and file opening available; the progress bar already
+            // reports the active worker. Only reject a second indexing request.
+            InvalidateRect(hwnd, nullptr, FALSE);
+            return false;
+        }
+        const bool completed = reload_runtime_after_index_worker(hwnd, exit_code);
+    gIndexProgressCompleted = completed ? GetTickCount64() : 0;
+    gIndexProgressStarted = 0;
+    }
+
+    // The private runtime owns an exclusive persistent-state load boundary.
+    // Release the GUI read/search handle before the crawler process opens the
+    // same state; otherwise the worker can fail before scanning begins.
+    gRuntime.reset();
+    gResults.clear();
+    gSuggestions.clear();
+
+    std::string error;
+    if (!such::runtime::launch_index_worker_tracked(request, &gIndexWorker, &error)) {
+        // A failed CreateProcess is never a completed/committed index rebuild.
+        (void)reload_runtime_after_index_worker(hwnd, -1);
+        gSearchError = error.empty() ? "Could not start background indexing." : error;
+        MessageBoxW(hwnd, widen_utf8(gSearchError).c_str(), L"Such", MB_OK | MB_ICONWARNING);
+        return false;
+    }
+    // Readers use an immutable filename checkpoint and never open the writer DB.
+    auto reader = std::make_unique<such::runtime::RuntimeClient>(std::filesystem::path{}, true);
+    std::string snapshot_error;
+    if (reader->load(&snapshot_error)) gRuntime = std::move(reader);
+    gIndexWorkerFailure.clear();
+    gIndexWorkerAction.assign(action);
+    gIndexProgressStarted = GetTickCount64();
+    gIndexProgressCompleted = 0;
+    if (gDailyRefreshReady) {
+        std::string persist_error;
+        if (!gDailyRefresh.record_attempt(such::runtime::DailyIndexRefresh::utc_now(), &persist_error)) {
+            gSearchError = "Daily index refresh state: " + persist_error;
+        }
+    }
+    gRuntimeIndexing = true;
+    if (gSearch) InvalidateRect(gSearch, nullptr, TRUE);
+    InvalidateRect(hwnd, nullptr, FALSE);
+    return true;
+}
+
 bool execute_index_command(HWND hwnd) {
     const auto command = such::ui::parse_index_command(narrow_utf8(gQuery), such::ui::PlatformDialect::Windows);
     if (!command.matched || !gRuntime) return false;
-    std::string error;
     switch (command.kind) {
         case such::ui::IndexCommandKind::AddRoot: {
             std::optional<std::filesystem::path> root;
             if (command.argument.has_value()) root = std::filesystem::path(widen_utf8(*command.argument));
             else root = choose_index_root(hwnd);
-            if (root && !gRuntime->add_root(*root, &error)) {
-                MessageBoxW(hwnd, widen_utf8("Could not index folder: " + error).c_str(), L"Such", MB_OK | MB_ICONWARNING);
+            if (root) {
+                (void)start_index_worker(hwnd,
+                    {such::runtime::IndexWorkerOperation::AddRoot, {*root}},
+                    "Folder indexing");
             }
             break;
         }
@@ -757,14 +935,19 @@ bool execute_index_command(HWND hwnd) {
             std::optional<std::filesystem::path> root;
             if (command.argument.has_value()) root = std::filesystem::path(widen_utf8(*command.argument));
             else root = choose_index_root(hwnd);
-            if (root && !gRuntime->replace_roots({*root}, &error)) {
-                MessageBoxW(hwnd, widen_utf8("Could not change search folder: " + error).c_str(), L"Such", MB_OK | MB_ICONWARNING);
+            if (root) {
+                (void)start_index_worker(hwnd,
+                    {such::runtime::IndexWorkerOperation::ReplaceRoots, {*root}},
+                    "Search-folder change");
             }
             break;
         }
-        case such::ui::IndexCommandKind::Reindex:
-            gRuntime->reindex_async();
+        case such::ui::IndexCommandKind::Reindex: {
+            such::runtime::IndexWorkerRequest request{such::runtime::IndexWorkerOperation::Reindex, {}};
+            if (command.argument.has_value()) request.shard_count = *command.argument == "auto" ? 0 : std::stoi(*command.argument);
+            (void)start_index_worker(hwnd, request, "Index rebuild");
             break;
+        }
         case such::ui::IndexCommandKind::ShowRoots:
             // Keep /roots visible so the list remains inspectable.
             refresh_query(hwnd, true);
@@ -772,7 +955,6 @@ bool execute_index_command(HWND hwnd) {
         case such::ui::IndexCommandKind::NoCommand:
             return false;
     }
-    gRuntimeIndexing = gRuntime->status().indexing;
     SetWindowTextW(gSearch, L"");
     gQuery.clear();
     gSuggestions.clear();
@@ -828,16 +1010,15 @@ bool choose_and_add_index_root(HWND hwnd, bool preserveQuery) {
     const auto root = choose_index_root(hwnd);
     if (!root.has_value()) return false;
 
-    std::string error;
-    if (!gRuntime->add_root(*root, &error)) {
-        MessageBoxW(hwnd, widen_utf8("Could not index folder: " + error).c_str(),
-                    L"Such", MB_OK | MB_ICONWARNING);
+    if (!start_index_worker(hwnd,
+            {such::runtime::IndexWorkerOperation::AddRoot, {*root}},
+            "Folder indexing")) {
         return false;
     }
 
-    // add_root() starts the worker asynchronously. Keep an ordinary search
-    // query intact so the timer can populate matching rows as soon as the
-    // catalog generation advances. /index itself remains a consumed command.
+    // The disk crawl runs in the sibling SuchCLI worker process. Keep an
+    // ordinary search query intact so the timer can populate matching rows as
+    // soon as the persistent catalog generation advances.
     if (!preserveQuery) {
         SetWindowTextW(gSearch, L"");
         gQuery.clear();
@@ -911,15 +1092,18 @@ std::vector<such::ui::ResultItem> root_items() {
 }
 
 void refresh_query(HWND hwnd, bool resetScroll = true) {
-    KillTimer(hwnd, kTimerSearchDebounce);
+    if (gSearchImeComposing) return; // Never dispatch preedit on index/UI refresh.
     const int len = GetWindowTextLengthW(gSearch);
     std::wstring text(static_cast<std::size_t>(std::max(0, len)) + 1, L'\0');
     if (len > 0) GetWindowTextW(gSearch, text.data(), len + 1);
     text.resize(static_cast<std::size_t>(std::max(0, len)));
     gQuery = text;
+    // A forced refresh (index generation, pin state, etc.) is separate from
+    // the input gate, but establishes its current committed text.
+    if (!gSearchImeComposing) (void)gSearchInputGate.accept(gQuery);
 
     const auto q = narrow_utf8(gQuery);
-    gSearchError.clear();
+    gSearchError = gIndexWorkerFailure;
     const auto agentCommand = such::ui::parse_agent_command(q, such::ui::PlatformDialect::Windows);
     const auto fontCommand = such::ui::parse_font_command(q, such::ui::PlatformDialect::Windows);
     const auto indexCommand = such::ui::parse_index_command(q, such::ui::PlatformDialect::Windows);
@@ -938,15 +1122,13 @@ void refresh_query(HWND hwnd, bool resetScroll = true) {
         else gResults.clear();
     } else {
         gSuggestions = such::ui::autocomplete(q, such::ui::PlatformDialect::Windows, observed);
-        const auto parsedSearch = such::ui::parse_search_query(
-            q, such::ui::PlatformDialect::Windows,
-            static_cast<std::int64_t>(std::time(nullptr)), observed);
-        const std::size_t resultLimit = parsedSearch.scope == such::ui::SearchScope::Content ? 200u : 0u;
         if (gDemo) {
             const auto now = static_cast<std::int64_t>(std::time(nullptr));
             gResults = such::ui::make_demo_results(q, such::ui::PlatformDialect::Windows, now);
         } else if (gRuntime) {
-            gResults = gRuntime->search(q, such::ui::PlatformDialect::Windows, resultLimit, &gSearchError);
+            std::string query_error;
+            gResults = gRuntime->search(q, such::ui::PlatformDialect::Windows, 0, &query_error);
+            gSearchError = !gIndexWorkerFailure.empty() ? gIndexWorkerFailure : query_error;
         } else {
             gResults.clear();
         }
@@ -1161,7 +1343,7 @@ void draw_detail_tree(HDC dc, const such::ui::WindowLayout& layout, float scale)
     const auto& m = layout.metrics;
     const float branch_h = std::clamp(m.row_height * 0.50f, 28.0f, 36.0f);
     const float branch_gap = std::clamp(m.row_gap * 0.75f, 4.0f, 7.0f);
-    const float base_y = layout.security.y + layout.security.height + m.security_to_results_gap;
+    const float base_y = layout.status.y + layout.status.height + m.status_to_results_gap;
     HGDIOBJ oldFont = SelectObject(dc, gPathFont);
     SetBkMode(dc, TRANSPARENT);
     for (std::size_t i = 0; i < detail.refinements.size(); ++i) {
@@ -1190,89 +1372,31 @@ void draw_detail_tree(HDC dc, const such::ui::WindowLayout& layout, float scale)
 }
 
 
-void draw_security_toggle(HDC dc, const such::ui::WindowLayout& layout, float scale) {
-    const RECT row = to_rect(layout.security, scale);
-    HGDIOBJ oldFont = SelectObject(dc, gPathFont ? gPathFont : GetStockObject(DEFAULT_GUI_FONT));
+void draw_indexing_status(HDC dc, const such::ui::WindowLayout& layout, float scale) {
+    const bool active = gRuntimeIndexing || gIndexWorker.valid();
+    const ULONGLONG now = GetTickCount64();
+    const bool completed = !active && gIndexProgressCompleted != 0 && now - gIndexProgressCompleted < 1400;
+    if (gDemo || (!active && !completed)) return;
+    RECT row = to_rect(layout.status, scale);
+    // The runtime ABI exposes no total work count. Animate an estimated fill,
+    // capped below completion until the worker has committed successfully.
+    const double elapsed = gIndexProgressStarted != 0 ? static_cast<double>(now - gIndexProgressStarted) / 1000.0 : 0.0;
+    const double fraction = completed ? 1.0 : 0.06 + 0.88 * (1.0 - std::exp(-elapsed / 18.0));
+    RECT track{row.left, row.top, row.right, row.top + std::max(2, px(5.0f, scale))};
+    fill_round(dc, track, px(2.0f, scale), kHairline);
+    RECT fill = track;
+    fill.right = fill.left + static_cast<LONG>(static_cast<double>(track.right - track.left) * fraction);
+    fill_round(dc, fill, px(2.0f, scale), kDarkGreen);
+    row.top = track.bottom + px(2.0f, scale);
+    HGDIOBJ old_font = SelectObject(dc, gPathFont ? gPathFont : GetStockObject(DEFAULT_GUI_FONT));
     SetBkMode(dc, TRANSPARENT);
-    SetTextColor(dc, kDarkGreen);
-
-    RECT label = row;
-    label.left += px(2.0f, scale);
-    label.right = label.left + px(64.0f, scale);
-    DrawTextW(dc, L"Security", -1, &label,
+    SetTextColor(dc, kPathGreen);
+    const std::wstring message = completed ? L"Indexing complete"
+        : (gIndexWorker.valid() && gRuntimeIndexedFiles > 0 ? L"Filename search ready; indexing contents... (estimated progress)"
+                                                           : L"Indexing filenames... (estimated progress)");
+    DrawTextW(dc, message.c_str(), -1, &row,
               DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-
-    const int switchW = px(34.0f, scale);
-    const int switchH = px(18.0f, scale);
-    const int switchX = row.left + px(72.0f, scale);
-    const int switchY = (row.top + row.bottom - switchH) / 2;
-    RECT sw{switchX, switchY, switchX + switchW, switchY + switchH};
-    fill_round(dc, sw, switchH / 2, gSecurityGate.active() ? kDarkGreen : kHairline);
-
-    const int knob = std::max(px(10.0f, scale), switchH - px(4.0f, scale));
-    const int knobX = gSecurityGate.active()
-        ? sw.right - knob - px(2.0f, scale)
-        : sw.left + px(2.0f, scale);
-    const int knobY = sw.top + (switchH - knob) / 2;
-    RECT k{knobX, knobY, knobX + knob, knobY + knob};
-    fill_round(dc, k, knob / 2, kBright);
-
-    SelectObject(dc, oldFont);
-}
-
-bool hit_security_toggle(HWND hwnd, int x, int y) {
-    RECT client{};
-    GetClientRect(hwnd, &client);
-    const float scale = scale_for_window(hwnd);
-    const auto layout = window_layout_for_query(
-        static_cast<float>(client.right) / scale,
-        static_cast<float>(client.bottom) / scale);
-    const RECT row = to_rect(layout.security, scale);
-    return point_in_rect(row, x, y);
-}
-
-void show_enterprise_security_notice(HWND hwnd) {
-    const wchar_t* message =
-        L"보안검색은 본사와 연락이 필요합니다.\n\n"
-        L"Enterprise Such needs connection to corporation\n\n"
-        L"https://such.heritage-labs.net\n\n"
-        L"Open the Enterprise Such website?";
-    const int answer = MessageBoxW(
-        hwnd, message, L"Such Enterprise Security",
-        MB_OKCANCEL | MB_ICONINFORMATION | MB_DEFBUTTON1);
-    if (answer == IDOK) {
-        (void)ShellExecuteW(
-            hwnd, L"open", L"https://such.heritage-labs.net",
-            nullptr, nullptr, SW_SHOWNORMAL);
-    }
-}
-
-void request_security_toggle(HWND hwnd) {
-    if (gSecurityGate.active()) {
-        (void)gSecurityGate.request_disable();
-        InvalidateRect(hwnd, nullptr, FALSE);
-        return;
-    }
-
-    std::string error;
-    const auto decision = gSecurityGate.request_enable(error);
-    switch (decision) {
-        case such::security::SecureSearchDecision::Activated:
-            break;
-        case such::security::SecureSearchDecision::RequiresEnterpriseActivation:
-            show_enterprise_security_notice(hwnd);
-            break;
-        case such::security::SecureSearchDecision::Denied:
-            MessageBoxW(
-                hwnd,
-                widen_utf8(error.empty() ? "Secure Search activation was denied" : error).c_str(),
-                L"Such Enterprise Security",
-                MB_OK | MB_ICONWARNING);
-            break;
-        case such::security::SecureSearchDecision::Deactivated:
-            break;
-    }
-    InvalidateRect(hwnd, nullptr, FALSE);
+    SelectObject(dc, old_font);
 }
 
 void paint(HWND hwnd) {
@@ -1301,21 +1425,35 @@ void paint(HWND hwnd) {
     SetBkMode(dc, TRANSPARENT);
 
     RECT search = to_rect(layout.search, scale);
-    fill_round(dc, search, px(m.search_radius, scale), kBright);
-    stroke_round(dc, search, px(m.search_radius, scale), kDarkGreen,
-                 std::max(1, px(1.0f, scale)));
-    RECT inner = search;
-    InflateRect(&inner, -1, -1);
-    HPEN hi = CreatePen(PS_SOLID, 1, kHighlight);
-    HGDIOBJ oldPen = SelectObject(dc, hi);
-    MoveToEx(dc, inner.left + px(m.search_radius, scale), inner.top, nullptr);
-    LineTo(dc, inner.right - px(m.search_radius, scale), inner.top);
-    SelectObject(dc, oldPen);
-    DeleteObject(hi);
+    const int radius = px(m.search_radius, scale);
+    const int border = std::max(2, px(1.6f, scale));
+    RECT emboss = search;
+    OffsetRect(&emboss, 0, std::max(1, px(1.0f, scale)));
+    InflateRect(&emboss, 1, 1);
+    stroke_round(dc, emboss, radius + 1, RGB(218, 213, 201), border);
+    OffsetRect(&emboss, 0, -std::max(2, px(2.0f, scale)));
+    stroke_round(dc, emboss, radius + 1, kHighlight);
+    fill_round(dc, search, radius, kBright);
+    // Clip the inset shade to the rounded interior, including curved corners.
+    const int savedSearchDc = SaveDC(dc);
+    HRGN interior = CreateRoundRectRgn(search.left + border, search.top + border,
+        search.right - border, search.bottom - border, radius * 2, radius * 2);
+    SelectClipRgn(dc, interior);
+    const int shadeDepth = std::max(3, px(3.0f, scale));
+    for (int layer = shadeDepth; layer > 0; --layer) {
+        RECT shade = search;
+        OffsetRect(&shade, 0, border + layer - 1);
+        const COLORREF tone = layer == 1 ? RGB(218, 217, 205) :
+                              layer == 2 ? RGB(235, 232, 220) : RGB(246, 242, 232);
+        stroke_round(dc, shade, radius, tone);
+    }
+    RestoreDC(dc, savedSearchDc);
+    DeleteObject(interior);
+    stroke_round(dc, search, radius, kDarkGreen, border);
     draw_search_glyph(dc,
                       static_cast<int>(search.left) + px(20.0f, scale),
                       static_cast<int>((search.top + search.bottom) / 2),
-                      px(14.0f, scale), kDarkGreen);
+                      px(18.0f, scale), kDarkGreen);
     if (!gQuery.empty()) {
         POINT cursor{};
         GetCursorPos(&cursor);
@@ -1324,7 +1462,7 @@ void paint(HWND hwnd) {
         draw_clear_button(dc, clear, point_in_rect(clear, cursor.x, cursor.y));
     }
 
-    draw_security_toggle(dc, layout, scale);
+    draw_indexing_status(dc, layout, scale);
     draw_detail_tree(dc, layout, scale);
 
     const RECT viewportPx = to_rect(layout.results_viewport, scale);
@@ -1346,12 +1484,15 @@ void paint(HWND hwnd) {
 
     if (!font_picker_visible() && !gQuery.empty() && gResults.empty()) {
         std::wstring emptyText;
-        if (!gDemo && gRuntime) {
-            const auto status = gRuntime->status();
+        if (!gDemo && (gRuntime || gIndexWorker.valid())) {
             if (!gSearchError.empty()) emptyText = widen_utf8("Search error: " + gSearchError);
-            else if (status.roots.empty()) emptyText = L"Press Enter to choose a folder to search";
-            else if (status.indexing) emptyText = L"Indexing files…";
-            else emptyText = L"No matches";
+            else if (gIndexWorker.valid()) emptyText.clear();
+            else if (gRuntime) {
+                const auto status = gRuntime->status();
+                if (status.roots.empty()) emptyText = L"Press Enter to choose a drive or folder to search";
+                else if (status.indexing) emptyText.clear();
+                else emptyText = L"No matches";
+            }
         } else if (gDemo || !gSuggestions.empty()) {
             emptyText = L"No matches";
         }
@@ -1399,15 +1540,23 @@ void layout_children(HWND hwnd) {
     update_scrollbar(hwnd);
 }
 
-void autocomplete_first(HWND hwnd) {
-    if (gSuggestions.empty()) return;
+void autocomplete_suggestion(HWND hwnd, std::size_t index, bool activate) {
+    if (index >= gSuggestions.size()) return;
+    const std::string token = gSuggestions[index].token;
     std::string current = narrow_utf8(gQuery);
     const auto pos = current.find_last_of(" \t\n");
-    current = (pos == std::string::npos ? std::string{} : current.substr(0, pos + 1)) + gSuggestions.front().token + " ";
+    current = (pos == std::string::npos ? std::string{} : current.substr(0, pos + 1)) + token + " ";
     const std::wstring completed = widen_utf8(current);
     SetWindowTextW(gSearch, completed.c_str());
     SendMessageW(gSearch, EM_SETSEL, static_cast<WPARAM>(completed.size()), static_cast<LPARAM>(completed.size()));
     refresh_query(hwnd);
+    if (activate && (token == "/drive" || token == "/index") && !gIndexWorker.valid()) {
+        (void)execute_index_command(hwnd);
+    }
+}
+
+void autocomplete_first(HWND hwnd) {
+    autocomplete_suggestion(hwnd, 0, false);
 }
 
 void move_selection(HWND hwnd, int delta) {
@@ -1430,10 +1579,40 @@ void move_selection(HWND hwnd, int delta) {
     InvalidateRect(hwnd, nullptr, FALSE);
 }
 
-LRESULT CALLBACK search_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+void refresh_committed_edit_input(HWND hwnd, bool reset_scroll = true) {
+    if (gSearchInputGate.composing()) return;
+    const int length = GetWindowTextLengthW(gSearch);
+    std::wstring value(static_cast<std::size_t>(std::max(0, length)) + 1u, L'\0');
+    if (length > 0) GetWindowTextW(gSearch, value.data(), length + 1);
+    value.resize(static_cast<std::size_t>(std::max(0, length)));
+    if (gSearchInputGate.accept(value)) refresh_query(hwnd, reset_scroll);
+}
+
+LRESULT CALLBACK search_subclass_proc(
+    HWND hwnd, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR subclass_id, DWORD_PTR reference_data) {
+    (void)subclass_id;
+    (void)reference_data;
     HWND parent = GetParent(hwnd);
+    if (msg == WM_IME_STARTCOMPOSITION) {
+        gSearchImeComposing = true;
+        gSearchInputGate.begin_composition();
+        return DefSubclassProc(hwnd, msg, wp, lp);
+    }
+    if (msg == WM_IME_ENDCOMPOSITION) {
+        const LRESULT result = DefSubclassProc(hwnd, msg, wp, lp);
+        gSearchImeComposing = false;
+        gSearchInputGate.end_composition();
+        PostMessageW(parent, kMsgRefreshAfterIme, 0, 0);
+        return result;
+    }
     if (msg == WM_MOUSEWHEEL) {
         return SendMessageW(parent, WM_MOUSEWHEEL, wp, lp);
+    }
+    if (msg == WM_KEYDOWN && gSearchImeComposing) {
+        // The native EDIT/IME must own Enter, Escape, arrows and candidate
+        // navigation while a composition is active. Consuming those keys here
+        // prevents Korean (and other IME) text from being committed.
+        return DefSubclassProc(hwnd, msg, wp, lp);
     }
     if (msg == WM_KEYDOWN) {
         switch (wp) {
@@ -1462,7 +1641,10 @@ LRESULT CALLBACK search_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             default: break;
         }
     }
-    return CallWindowProcW(gOldSearchProc, hwnd, msg, wp, lp);
+    if (msg == WM_NCDESTROY) {
+        RemoveWindowSubclass(hwnd, search_subclass_proc, 1u);
+    }
+    return DefSubclassProc(hwnd, msg, wp, lp);
 }
 
 LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
@@ -1473,11 +1655,15 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                                       0, 0, 10, 10, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kSearchId)),
                                       reinterpret_cast<LPCREATESTRUCTW>(lp)->hInstance, nullptr);
             if (!gSearch) return -1;
-            const std::wstring searchPlaceholder = widen_utf8(such::ui::design::kSearchPlaceholder);
+            const std::string searchHint = std::string(such::ui::design::kSearchPlaceholder) + "   /drive  Choose indexed drive or folder";
+            const std::wstring searchPlaceholder = widen_utf8(searchHint);
             SendMessageW(gSearch, EM_SETCUEBANNER, TRUE,
                          reinterpret_cast<LPARAM>(searchPlaceholder.c_str()));
-            gOldSearchProc = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(gSearch, GWLP_WNDPROC,
-                                                                         reinterpret_cast<LONG_PTR>(search_proc)));
+            if (SetWindowSubclass(gSearch, search_subclass_proc, 1u, 0u) == FALSE) {
+                DestroyWindow(gSearch);
+                gSearch = nullptr;
+                return -1;
+            }
             layout_children(hwnd);
             SetFocus(gSearch);
             return 0;
@@ -1521,10 +1707,7 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return reinterpret_cast<LRESULT>(gSearchBrush);
         }
         case WM_COMMAND:
-            if (LOWORD(wp) == kSearchId && HIWORD(wp) == EN_CHANGE) {
-                KillTimer(hwnd, kTimerSearchDebounce);
-                SetTimer(hwnd, kTimerSearchDebounce, 300, nullptr);
-            }
+            if (LOWORD(wp) == kSearchId && HIWORD(wp) == EN_CHANGE) refresh_committed_edit_input(hwnd);
             return 0;
         case kMsgAutocomplete:
             autocomplete_first(hwnd);
@@ -1539,6 +1722,9 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         case kMsgEnsureIndexRoot:
             (void)choose_and_add_index_root(hwnd, wp != 0);
+            return 0;
+        case kMsgRefreshAfterIme:
+            refresh_committed_edit_input(hwnd, false);
             return 0;
         case WM_MOUSEWHEEL: {
             const int delta = GET_WHEEL_DELTA_WPARAM(wp);
@@ -1604,10 +1790,6 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (GetTickCount64() < gIgnoreMouseUntil) return 0;
             const int x = GET_X_LPARAM(lp);
             const int y = GET_Y_LPARAM(lp);
-            if (hit_security_toggle(hwnd, x, y)) {
-                request_security_toggle(hwnd);
-                return 0;
-            }
             SetFocus(gSearch);
             RECT client{};
             GetClientRect(hwnd, &client);
@@ -1622,6 +1804,15 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 SendMessageW(gSearch, EM_SETSEL, 0, 0);
                 refresh_query(hwnd);
                 return 0;
+            }
+            if (!gSuggestions.empty()) {
+                const int itemH = px(30.0f, uiScale);
+                const int count = std::min(6, static_cast<int>(gSuggestions.size()));
+                const int top = search.bottom + px(4.0f, uiScale);
+                if (x >= search.left && x < search.right && y >= top && y < top + itemH * count) {
+                    autocomplete_suggestion(hwnd, static_cast<std::size_t>((y - top) / itemH), true);
+                    return 0;
+                }
             }
             if (const int fontRow = hit_font_row(hwnd, x, y); fontRow >= 0) {
                 gFontPickerSelection = fontRow;
@@ -1682,10 +1873,6 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (!pointer_client_point(hwnd, wp, client, pointerId)) return 0;
             if (gActivePointerId != 0 && gActivePointerId != pointerId) return 0;
             gIgnoreMouseUntil = GetTickCount64() + 350;
-            if (hit_security_toggle(hwnd, client.x, client.y)) {
-                request_security_toggle(hwnd);
-                return 0;
-            }
             int actionRow = -1; ResultAction action{};
             if (hit_swipe_action(hwnd, client.x, client.y, actionRow, action)) {
                 POINT screen = client; ClientToScreen(hwnd, &screen);
@@ -1791,24 +1978,55 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         case WM_TIMER:
             if (wp == 1 || wp == 2) { DestroyWindow(hwnd); return 0; }
-            if (wp == kTimerSearchDebounce) {
-                KillTimer(hwnd, kTimerSearchDebounce);
-                refresh_query(hwnd);
-                return 0;
-            }
-            if (wp == kTimerRuntimeRefresh && gRuntime) {
-                const auto status = gRuntime->status();
-                const auto generation = status.generation;
-                const bool activityChanged = status.indexing != gRuntimeIndexing;
-                if (generation != gRuntimeGeneration || status.indexed_files != gRuntimeIndexedFiles) {
-                    gRuntimeGeneration = generation;
-                    gRuntimeIndexedFiles = status.indexed_files;
-                    refresh_query(hwnd, false);
-                }
-                if (activityChanged) {
-                    gRuntimeIndexing = status.indexing;
-                    if (gSearch) InvalidateRect(gSearch, nullptr, TRUE);
+            if (wp == kTimerRuntimeRefresh) {
+                if (gRuntimeIndexing || gIndexWorker.valid() || gIndexProgressCompleted != 0) {
+                    if (gIndexProgressStarted == 0 && (gRuntimeIndexing || gIndexWorker.valid())) gIndexProgressStarted = GetTickCount64();
+                    if (gIndexProgressCompleted != 0 && GetTickCount64() - gIndexProgressCompleted >= 1400) gIndexProgressCompleted = 0;
                     InvalidateRect(hwnd, nullptr, FALSE);
+                }
+                if (gIndexWorker.valid()) {
+                    (void)poll_index_worker_and_reload(hwnd);
+                    if (gIndexWorker.valid()) {
+                        if (gRuntime) {
+                            const auto snapshot = gRuntime->status();
+                            if (snapshot.generation != gRuntimeGeneration || snapshot.indexed_files != gRuntimeIndexedFiles) {
+                                gRuntimeGeneration = snapshot.generation;
+                                gRuntimeIndexedFiles = snapshot.indexed_files;
+                                refresh_query(hwnd, false);
+                            }
+                        }
+                        return 0;
+                    }
+                }
+                if (gRuntime) {
+                    const auto status = gRuntime->status();
+                    const auto generation = status.generation;
+                    const bool activityChanged = status.indexing != gRuntimeIndexing;
+                    if (generation != gRuntimeGeneration || status.indexed_files != gRuntimeIndexedFiles) {
+                        gRuntimeGeneration = generation;
+                        gRuntimeIndexedFiles = status.indexed_files;
+                        refresh_query(hwnd, false);
+                    }
+                    if (activityChanged) {
+                        gRuntimeIndexing = status.indexing;
+                        if (gSearch) InvalidateRect(gSearch, nullptr, TRUE);
+                        InvalidateRect(hwnd, nullptr, FALSE);
+                    }
+                    // Schedule only in the visible GUI, never in a background service.
+                    if (!gSmoke && !gDemo && gDailyRefreshReady && !status.indexing &&
+                        gDailyRefresh.due(such::runtime::DailyIndexRefresh::utc_now(), true, gIndexWorker.valid())) {
+                        std::string roots_error;
+                        const auto roots = gRuntime->roots(&roots_error);
+                        if (roots_error.empty() && !roots.empty()) {
+                            if (!start_index_worker(hwnd,
+                                    {such::runtime::IndexWorkerOperation::Reindex, {}}, "Daily index refresh")) {
+                                std::string persist_error;
+                                if (!gDailyRefresh.record_failure(such::runtime::DailyIndexRefresh::utc_now(), &persist_error)) {
+                                    gSearchError += " (Could not persist retry time: " + persist_error + ")";
+                                }
+                            }
+                        }
+                    }
                 }
                 return 0;
             }
@@ -1824,7 +2042,7 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 gSearchBrush = nullptr;
             }
             KillTimer(hwnd, kTimerRuntimeRefresh);
-            KillTimer(hwnd, kTimerSearchDebounce);
+            such::runtime::close_index_worker_ticket(&gIndexWorker);
             gRuntime.reset();
             PostQuitMessage(0);
             return 0;
@@ -1836,6 +2054,11 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 } // namespace
 
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
+    struct ScopedGraphics {
+        ULONG_PTR token = 0;
+        ScopedGraphics() { Gdiplus::GdiplusStartupInput input; Gdiplus::GdiplusStartup(&token, &input, nullptr); }
+        ~ScopedGraphics() { if (token) Gdiplus::GdiplusShutdown(token); }
+    } graphics;
     [[maybe_unused]] ScopedComApartment comApartment;
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     if (const auto preferred = such::ui::load_font_preference(); preferred && !preferred->empty()) {
@@ -1897,7 +2120,17 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
         gRuntimeGeneration = status.generation;
         gRuntimeIndexedFiles = status.indexed_files;
         gRuntimeIndexing = status.indexing;
-        if (!status.indexing && status.indexed_files == 0 && !status.roots.empty()) gRuntime->reindex_async();
+        // Never start a disk crawl before the first window is visible. The GUI
+        // only records whether an empty persisted corpus needs a worker.
+        gStartupReindexNeeded = !gSmoke && !status.indexing &&
+                                status.indexed_files == 0 && !status.roots.empty();
+        if (!gSmoke) {
+            std::string state_error;
+            gDailyRefreshReady = gDailyRefresh.load(&state_error);
+            if (!gDailyRefreshReady) {
+                std::fprintf(stderr, "Such daily refresh disabled: %s\n", state_error.c_str());
+            }
+        }
     }
 
     if (gDemo) {
@@ -1910,7 +2143,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     wc.style = CS_DBLCLKS;
     wc.hInstance = instance;
     wc.lpfnWndProc = wnd_proc;
-    wc.lpszClassName = kClassName;
+    wc.lpszClassName = such::version::kWindowClassName;
     wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     wc.hbrBackground = nullptr;
     wc.hIcon = static_cast<HICON>(LoadImageW(instance, MAKEINTRESOURCEW(101), IMAGE_ICON, 32, 32, LR_DEFAULTCOLOR));
@@ -1920,7 +2153,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     if (!RegisterClassExW(&wc)) return 2;
 
     const std::wstring windowTitle = widen_utf8(std::string(such::version::kDisplayName));
-    HWND hwnd = CreateWindowExW(0, kClassName, windowTitle.c_str(), WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN | WS_VSCROLL,
+    HWND hwnd = CreateWindowExW(0, such::version::kWindowClassName, windowTitle.c_str(), WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN | WS_VSCROLL,
                                 CW_USEDEFAULT, CW_USEDEFAULT, 760, 600,
                                 nullptr, nullptr, instance, nullptr);
     if (!hwnd) return 3;
@@ -1944,6 +2177,12 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
             }
         }
     }
+    if (gStartupReindexNeeded && !gSmoke && !gDemo) {
+        (void)start_index_worker(hwnd,
+            {such::runtime::IndexWorkerOperation::Reindex, {}},
+            "Startup index rebuild");
+        gStartupReindexNeeded = false;
+    }
     if (gSmoke) SetTimer(hwnd, 1, 250, nullptr);
     if (gSmokeHold) SetTimer(hwnd, 2, 3000, nullptr);
 
@@ -1954,4 +2193,3 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     }
     return static_cast<int>(msg.wParam);
 }
-

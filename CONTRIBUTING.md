@@ -65,7 +65,7 @@ Fix behavior at the architectural layer that owns it. Avoid platform-local or ca
 
 Do not commit local build directories, caches, debug symbols, credentials, or generated temporary files.
 
-Approved production runtime binaries present in `.runtime/` are release inputs maintained by Heritage Inc. They are not ordinary contribution targets and are not licensed under Apache-2.0 merely because they are stored in this repository.
+Approved production runtime binaries present in `runtime/` are release inputs maintained by Heritage Inc. They are not ordinary contribution targets and are not licensed under Apache-2.0 merely because they are stored in this repository.
 
 ## Conduct
 

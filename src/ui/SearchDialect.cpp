@@ -414,9 +414,16 @@ std::vector<Suggestion> autocomplete(
             {"/inside", "Search inside indexed files"},
             {"/;", "Add detail-search branch"},
         }};
+        // Windows uses a single slash for index commands as well.
+        if (dialect == PlatformDialect::Windows && std::string_view("/drive").starts_with(lower_ascii(tail))) {
+            universal.push_back({"/drive", "Choose search drive or folder"});
+        }
         const std::string typed = lower_ascii(tail);
         for (const auto& command : commands) {
             if (lower_ascii(command.token).starts_with(typed)) universal.push_back(command);
+        }
+        if (dialect == PlatformDialect::Windows && std::string_view("/index").starts_with(typed)) {
+            universal.push_back({"/index", "Rebuild index for current folders"});
         }
         return universal;
     }

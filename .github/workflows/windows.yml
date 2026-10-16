@@ -27,6 +27,6 @@ jobs:
           -Arch x64
           -Generator 'Visual Studio 17 2022'
           -Jobs 4
-          -RuntimeLibraryPath './.runtime/windows-x64/SuchRuntimePrivate.dll'
+          -RuntimeLibraryPath './runtime/windows-x64/SuchRuntimePrivate.dll'
           -RequireRuntime
 

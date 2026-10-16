@@ -1,11 +1,13 @@
 #include <such/Version.h>
 #include <such/cli/CliApp.h>
 #include <such/runtime/RuntimeClient.h>
-#include <such/security/SecureSearchGate.h>
+#include <such/runtime/IndexWorkerLauncher.h>
+#include <such/runtime/DailyIndexRefresh.h>
 #include <such/ui/AgentLauncher.h>
 #include <such/ui/DesignContract.h>
 #include <such/ui/DisplayScalePolicy.h>
 #include <such/ui/IndexCommands.h>
+#include <such/ui/CommittedInputGate.h>
 #include <such/ui/FrontendLease.h>
 #include <such/ui/FontSettings.h>
 #include <such/ui/ResponsiveLayout.h>
@@ -32,11 +34,13 @@
 #include <csignal>
 #include <cstdlib>
 #include <filesystem>
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
 #include <poll.h>
 #include <pwd.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 namespace {
@@ -61,6 +65,7 @@ XIC gInputContext = nullptr;
 
 struct UiState {
     std::string query;
+    such::ui::CommittedInputGate<std::string> input_gate;
     std::vector<such::ui::ResultItem> results;
     std::vector<such::ui::Suggestion> suggestions;
     std::string search_error;
@@ -74,11 +79,15 @@ struct UiState {
     such::platform::linuxui::NativeIconCache icon_cache;
     std::string font_family;
     such::runtime::RuntimeClient runtime;
+    std::optional<such::runtime::IndexWorkerRequest> startup_worker_request;
+    such::runtime::IndexWorkerTicket index_worker;
+    std::string index_worker_action;
+    such::runtime::DailyIndexRefresh daily_refresh{such::runtime::DailyIndexRefresh::default_state_file()};
+    bool daily_state_ready = false;
     std::uint64_t runtime_generation = 0;
     std::size_t runtime_indexed_files = 0;
     bool runtime_indexing = false;
-    such::security::SecureSearchGate security_gate;
-    bool security_notice_open = false;
+    bool initial_root_picker = false;
     float scroll_dip = 0.0f;
     float ui_scale = 1.0f;
     such::ui::IndexCommandKind root_picker_kind = such::ui::IndexCommandKind::NoCommand;
@@ -100,11 +109,11 @@ such::ui::WindowLayout x11_layout(const UiState& state) {
     auto& m = out.metrics;
     auto mul = [scale](float& v) { v *= scale; };
     mul(m.width); mul(m.height); mul(m.side_padding); mul(m.top_padding); mul(m.bottom_padding);
-    mul(m.search_height); mul(m.search_to_results_gap); mul(m.security_height); mul(m.security_to_results_gap); mul(m.row_height); mul(m.row_gap);
+    mul(m.search_height); mul(m.search_to_results_gap); mul(m.status_height); mul(m.status_to_results_gap); mul(m.row_height); mul(m.row_gap);
     mul(m.file_icon); mul(m.icon_gap); mul(m.extension_badge_height); mul(m.filename_font);
     mul(m.path_font); mul(m.corner_radius); mul(m.search_radius); mul(m.swipe_action_width);
     out.search = scale_rect(out.search, scale);
-    out.security = scale_rect(out.security, scale);
+    out.status = scale_rect(out.status, scale);
     out.results_viewport = scale_rect(out.results_viewport, scale);
     for (auto& row : out.rows) row = scale_rect(row, scale);
 
@@ -167,6 +176,86 @@ void pop_utf8_codepoint(std::string& text) {
     if (text.empty()) return;
     text.pop_back();
     while (!text.empty() && (static_cast<unsigned char>(text.back()) & 0xC0u) == 0x80u) text.pop_back();
+}
+
+XIC create_input_context(Window window) {
+    if (gInputMethod == nullptr) return nullptr;
+
+    XIMStyles* styles = nullptr;
+    if (XGetIMValues(gInputMethod, XNQueryInputStyle, &styles, nullptr) != nullptr || styles == nullptr) {
+        return nullptr;
+    }
+
+    constexpr std::array<XIMStyle, 4> preferred_styles{{
+        XIMPreeditNothing | XIMStatusNothing,
+        XIMPreeditNothing | XIMStatusNone,
+        XIMPreeditNone | XIMStatusNothing,
+        XIMPreeditNone | XIMStatusNone,
+    }};
+
+    XIMStyle selected = 0;
+    for (const XIMStyle preferred : preferred_styles) {
+        for (unsigned short i = 0; i < styles->count_styles; ++i) {
+            if (styles->supported_styles[i] == preferred) {
+                selected = preferred;
+                break;
+            }
+        }
+        if (selected != 0) break;
+    }
+    XFree(styles);
+    if (selected == 0) return nullptr;
+
+    return XCreateIC(gInputMethod,
+        XNInputStyle, selected,
+        XNClientWindow, window,
+        XNFocusWindow, window,
+        nullptr);
+}
+
+struct Utf8KeyLookup {
+    KeySym keysym = NoSymbol;
+    std::string text;
+};
+
+bool has_printable_utf8_commit(const Utf8KeyLookup& key) {
+    return !key.text.empty() && static_cast<unsigned char>(key.text.front()) >= 0x20u;
+}
+
+Utf8KeyLookup lookup_utf8_key(XKeyEvent* event) {
+    Utf8KeyLookup out;
+    if (event == nullptr) return out;
+
+    if (gInputContext != nullptr) {
+        std::array<char, 64> stack_buffer{};
+        Status status = XLookupNone;
+        int length = Xutf8LookupString(
+            gInputContext, event, stack_buffer.data(),
+            static_cast<int>(stack_buffer.size() - 1u), &out.keysym, &status);
+
+        if (status == XBufferOverflow && length > 0) {
+            std::vector<char> dynamic_buffer(static_cast<std::size_t>(length) + 1u, '\0');
+            status = XLookupNone;
+            length = Xutf8LookupString(
+                gInputContext, event, dynamic_buffer.data(), length,
+                &out.keysym, &status);
+            if (length > 0 && (status == XLookupChars || status == XLookupBoth)) {
+                out.text.assign(dynamic_buffer.data(), static_cast<std::size_t>(length));
+            }
+        } else if (length > 0 && (status == XLookupChars || status == XLookupBoth)) {
+            out.text.assign(stack_buffer.data(), static_cast<std::size_t>(length));
+        }
+
+        if (status != XLookupKeySym && status != XLookupBoth) out.keysym = NoSymbol;
+        return out;
+    }
+
+    std::array<char, 64> fallback{};
+    const int length = XLookupString(
+        event, fallback.data(), static_cast<int>(fallback.size() - 1u),
+        &out.keysym, nullptr);
+    if (length > 0) out.text.assign(fallback.data(), static_cast<std::size_t>(length));
+    return out;
 }
 
 std::string ellipsize_utf8(std::string text, int max_width) {
@@ -338,7 +427,7 @@ void refresh_query(UiState& state, bool reset_scroll = true) {
     const auto fontCommand = such::ui::parse_font_command(state.query, such::ui::PlatformDialect::UnixLike);
     const auto agentCommand = such::ui::parse_agent_command(state.query, such::ui::PlatformDialect::UnixLike);
     const auto indexCommand = such::ui::parse_index_command(state.query, such::ui::PlatformDialect::UnixLike);
-    const auto observed = state.runtime.observed_extensions();
+    const auto observed = state.runtime.available() ? state.runtime.observed_extensions() : std::vector<std::string>{};
     const auto previous_root_picker_kind = state.root_picker_kind;
     state.root_picker_kind = such::ui::IndexCommandKind::NoCommand;
     if (agentCommand.matched) {
@@ -379,6 +468,9 @@ void refresh_query(UiState& state, bool reset_scroll = true) {
         if (state.demo) {
             state.results = such::ui::make_demo_results(state.query, such::ui::PlatformDialect::UnixLike,
                                                        static_cast<std::int64_t>(std::time(nullptr)));
+        } else if (!state.runtime.available()) {
+            state.results.clear();
+            state.search_error = state.runtime_indexing ? "Indexing selected folder..." : "Search index is temporarily unavailable";
         } else {
             state.results = state.runtime.search(state.query, such::ui::PlatformDialect::UnixLike, 0, &state.search_error);
         }
@@ -396,6 +488,89 @@ void refresh_query(UiState& state, bool reset_scroll = true) {
     const auto layout = x11_layout(state);
     state.scroll_dip = std::clamp(state.scroll_dip, 0.0f, such::ui::max_result_scroll(layout, state.results.size()));
     state.swipe.close();
+}
+
+bool reload_runtime_after_index_worker_linux(UiState& state, int worker_exit_code) {
+    std::string runtime_error;
+    if (!state.runtime.load(&runtime_error)) {
+        state.runtime_indexing = false;
+        state.search_error = "Could not reload Such index after background worker: " + runtime_error;
+        return false;
+    }
+
+    const auto status = state.runtime.status();
+    state.runtime_generation = status.generation;
+    state.runtime_indexed_files = status.indexed_files;
+    state.runtime_indexing = status.indexing;
+    refresh_query(state, false);
+    if (worker_exit_code != 0 || status.indexing || !status.last_error.empty()) {
+        state.search_error = !status.last_error.empty() ? status.last_error : (state.index_worker_action.empty()
+            ? "Background indexing failed"
+            : state.index_worker_action + " failed");
+    }
+    if (state.daily_state_ready) {
+        std::string persist_error;
+        const bool saved = (worker_exit_code == 0 && !status.indexing && status.last_error.empty())
+            ? state.daily_refresh.record_success(such::runtime::DailyIndexRefresh::utc_now(), &persist_error)
+            : state.daily_refresh.record_failure(such::runtime::DailyIndexRefresh::utc_now(), &persist_error);
+        if (!saved) state.search_error = "Daily index refresh state: " + persist_error;
+    }
+    state.index_worker_action.clear();
+    return worker_exit_code == 0 && !status.indexing && status.last_error.empty();
+}
+
+bool poll_index_worker_linux(UiState& state) {
+    if (!state.index_worker.valid()) return false;
+    int exit_code = 0;
+    const auto poll = such::runtime::poll_index_worker(&state.index_worker, &exit_code);
+    if (poll == such::runtime::IndexWorkerPoll::Running) return false;
+    (void)reload_runtime_after_index_worker_linux(state, exit_code);
+    return true;
+}
+
+bool start_index_worker_linux(
+    UiState& state,
+    const such::runtime::IndexWorkerRequest& request,
+    std::string_view action,
+    std::string* error) {
+    if (state.index_worker.valid()) {
+        int exit_code = 0;
+        const auto poll = such::runtime::poll_index_worker(&state.index_worker, &exit_code);
+        if (poll == such::runtime::IndexWorkerPoll::Running) {
+            if (error != nullptr) *error = "Such is already indexing another drive or folder";
+            return false;
+        }
+        (void)reload_runtime_after_index_worker_linux(state, exit_code);
+    }
+
+    // The private runtime owns an exclusive persistent-state load boundary.
+    // Match the Windows ownership contract: release the GUI runtime before the
+    // worker opens the same state, then reload only after the tracked worker exits.
+    state.runtime.unload();
+    state.results.clear();
+    state.suggestions.clear();
+
+    std::string launch_error;
+    if (!such::runtime::launch_index_worker_tracked(request, &state.index_worker, &launch_error)) {
+        std::string reload_error;
+        (void)state.runtime.load(&reload_error);
+        state.runtime_indexing = false;
+        if (error != nullptr) {
+            *error = !launch_error.empty() ? launch_error
+                                           : (!reload_error.empty() ? reload_error : "Could not start background indexing");
+        }
+        return false;
+    }
+
+    state.index_worker_action.assign(action);
+    if (state.daily_state_ready) {
+        std::string persist_error;
+        if (!state.daily_refresh.record_attempt(such::runtime::DailyIndexRefresh::utc_now(), &persist_error)) {
+            state.search_error = "Daily index refresh state: " + persist_error;
+        }
+    }
+    state.runtime_indexing = true;
+    return true;
 }
 
 int hit_row(const UiState& state, int x, int y) {
@@ -452,13 +627,29 @@ bool hit_swipe_action(const UiState& state, int x, int y, int& row_index, such::
     return true;
 }
 
-void open_item_linux(const such::ui::ResultItem& item) {
-    if (item.path.empty()) return;
-    const pid_t pid = ::fork();
-    if (pid == 0) {
-        ::execlp("xdg-open", "xdg-open", item.path.c_str(), static_cast<char*>(nullptr));
+bool spawn_detached_xdg_open(const std::string& target) {
+    if (target.empty()) return false;
+    const pid_t launcher = ::fork();
+    if (launcher < 0) return false;
+    if (launcher == 0) {
+        if (::setsid() < 0) _exit(126);
+        const pid_t child = ::fork();
+        if (child < 0) _exit(126);
+        if (child > 0) _exit(0);
+        ::execlp("xdg-open", "xdg-open", target.c_str(), static_cast<char*>(nullptr));
         _exit(127);
     }
+
+    int status = 0;
+    while (::waitpid(launcher, &status, 0) < 0) {
+        if (errno == EINTR) continue;
+        return false;
+    }
+    return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+}
+
+void open_item_linux(const such::ui::ResultItem& item) {
+    (void)spawn_detached_xdg_open(item.path);
 }
 
 void open_location_linux(const such::ui::ResultItem& item) {
@@ -466,11 +657,7 @@ void open_location_linux(const such::ui::ResultItem& item) {
     std::filesystem::path directory = path.has_parent_path() ? path.parent_path() : path;
     if (directory.empty()) return;
     const std::string dir = directory.string();
-    const pid_t pid = ::fork();
-    if (pid == 0) {
-        ::execlp("xdg-open", "xdg-open", dir.c_str(), static_cast<char*>(nullptr));
-        _exit(127);
-    }
+    (void)spawn_detached_xdg_open(dir);
 }
 
 void perform_action(UiState& state, int row_index, such::ui::ResultAction action) {
@@ -522,7 +709,7 @@ void draw_detail_tree(Display* d, Window w, GC gc, const UiState& state, const s
     const int branch_h = dip_px(state, 32.0f);
     const int gap = dip_px(state, 6.0f);
     const int indent_step = dip_px(state, 18.0f);
-    int y = static_cast<int>(layout.security.y + layout.security.height + layout.metrics.security_to_results_gap);
+    int y = static_cast<int>(layout.status.y + layout.status.height + layout.metrics.status_to_results_gap);
     for (std::size_t i = 0; i < detail.refinements.size(); ++i) {
         const int indent = static_cast<int>(i + 1u) * indent_step;
         const int x = static_cast<int>(layout.search.x) + indent;
@@ -542,128 +729,13 @@ void draw_detail_tree(Display* d, Window w, GC gc, const UiState& state, const s
 }
 
 
-bool point_in_rect(const such::ui::RectF& r, int x, int y) {
-    return static_cast<float>(x) >= r.x && static_cast<float>(x) < r.x + r.width &&
-           static_cast<float>(y) >= r.y && static_cast<float>(y) < r.y + r.height;
-}
-
-void draw_security_toggle(Display* d, Window w, GC gc, const UiState& state,
+void draw_indexing_status(Display* d, Window w, GC gc, const UiState& state,
                           const such::ui::WindowLayout& layout) {
-    const auto& r = layout.security;
-    const int y_mid = static_cast<int>(r.y + r.height * 0.5f);
-    set_color(d, gc, kDarkGreen);
-    draw_utf8(d, w, gc,
-              static_cast<int>(r.x + dip_px(state, 2.0f)),
-              y_mid + dip_px(state, 5.0f),
-              "Security");
-
-    const int switch_w = dip_px(state, 34.0f);
-    const int switch_h = dip_px(state, 18.0f);
-    const int switch_x = static_cast<int>(r.x) + dip_px(state, 72.0f);
-    const int switch_y = y_mid - switch_h / 2;
-    const bool active = state.security_gate.active();
-    fill_round_rect(d, w, gc, switch_x, switch_y, switch_w, switch_h, switch_h / 2,
-                    active ? kDarkGreen : kHairline);
-    const int knob = std::max(10, switch_h - dip_px(state, 4.0f));
-    const int knob_x = active
-        ? switch_x + switch_w - knob - dip_px(state, 2.0f)
-        : switch_x + dip_px(state, 2.0f);
-    const int knob_y = switch_y + (switch_h - knob) / 2;
-    fill_round_rect(d, w, gc, knob_x, knob_y, knob, knob, knob / 2, kBright);
-}
-
-such::ui::RectF security_notice_panel(const UiState& state) {
-    const float width = std::min(static_cast<float>(state.width) - dip_px(state, 32.0f),
-                                 static_cast<float>(dip_px(state, 520.0f)));
-    const float height = static_cast<float>(dip_px(state, 190.0f));
-    return {(static_cast<float>(state.width) - width) * 0.5f,
-            (static_cast<float>(state.height) - height) * 0.5f,
-            width, height};
-}
-
-such::ui::RectF security_notice_contact_button(const UiState& state) {
-    const auto panel = security_notice_panel(state);
-    return {panel.x + dip_px(state, 24.0f),
-            panel.y + panel.height - dip_px(state, 48.0f),
-            static_cast<float>(dip_px(state, 145.0f)),
-            static_cast<float>(dip_px(state, 30.0f))};
-}
-
-such::ui::RectF security_notice_cancel_button(const UiState& state) {
-    const auto panel = security_notice_panel(state);
-    return {panel.x + panel.width - dip_px(state, 104.0f),
-            panel.y + panel.height - dip_px(state, 48.0f),
-            static_cast<float>(dip_px(state, 80.0f)),
-            static_cast<float>(dip_px(state, 30.0f))};
-}
-
-void draw_security_notice(Display* d, Window w, GC gc, const UiState& state) {
-    if (!state.security_notice_open) return;
-    const auto panel = security_notice_panel(state);
-    fill_round_rect(d, w, gc, static_cast<int>(panel.x), static_cast<int>(panel.y),
-                    static_cast<int>(panel.width), static_cast<int>(panel.height),
-                    dip_px(state, 8.0f), kBright);
-    stroke_round_rect(d, w, gc, static_cast<int>(panel.x), static_cast<int>(panel.y),
-                      static_cast<int>(panel.width), static_cast<int>(panel.height),
-                      dip_px(state, 8.0f), kDarkGreen, dip_px(state, 1.0f));
-
-    set_color(d, gc, kDarkGreen);
-    draw_utf8(d, w, gc, static_cast<int>(panel.x) + dip_px(state, 24.0f),
-              static_cast<int>(panel.y) + dip_px(state, 38.0f),
-              "보안검색은 본사와 연락이 필요합니다.");
+    if (state.demo || (!state.runtime_indexing && !state.index_worker.valid())) return;
+    const auto& r = layout.status;
     set_color(d, gc, kPathGreen);
-    draw_utf8(d, w, gc, static_cast<int>(panel.x) + dip_px(state, 24.0f),
-              static_cast<int>(panel.y) + dip_px(state, 70.0f),
-              "Enterprise Such needs connection to corporation");
-    draw_utf8(d, w, gc, static_cast<int>(panel.x) + dip_px(state, 24.0f),
-              static_cast<int>(panel.y) + dip_px(state, 98.0f),
-              such::security::kEnterpriseSecurityUrl);
-
-    const auto contact = security_notice_contact_button(state);
-    fill_round_rect(d, w, gc, static_cast<int>(contact.x), static_cast<int>(contact.y),
-                    static_cast<int>(contact.width), static_cast<int>(contact.height),
-                    dip_px(state, 5.0f), kDarkGreen);
-    set_color(d, gc, kBright);
-    draw_utf8(d, w, gc, static_cast<int>(contact.x) + dip_px(state, 12.0f),
-              static_cast<int>(contact.y) + dip_px(state, 21.0f), "Contact Heritage");
-
-    const auto cancel = security_notice_cancel_button(state);
-    fill_round_rect(d, w, gc, static_cast<int>(cancel.x), static_cast<int>(cancel.y),
-                    static_cast<int>(cancel.width), static_cast<int>(cancel.height),
-                    dip_px(state, 5.0f), kPaper);
-    stroke_round_rect(d, w, gc, static_cast<int>(cancel.x), static_cast<int>(cancel.y),
-                      static_cast<int>(cancel.width), static_cast<int>(cancel.height),
-                      dip_px(state, 5.0f), kHairline);
-    set_color(d, gc, kDarkGreen);
-    draw_utf8(d, w, gc, static_cast<int>(cancel.x) + dip_px(state, 15.0f),
-              static_cast<int>(cancel.y) + dip_px(state, 21.0f), "Cancel");
-}
-
-
-void request_security_toggle(UiState& state) {
-    if (state.security_gate.active()) {
-        (void)state.security_gate.request_disable();
-        state.security_notice_open = false;
-        return;
-    }
-
-    std::string error;
-    const auto decision = state.security_gate.request_enable(error);
-    if (decision == such::security::SecureSearchDecision::RequiresEnterpriseActivation) {
-        state.security_notice_open = true;
-        return;
-    }
-    if (decision == such::security::SecureSearchDecision::Denied) {
-        state.search_error = error.empty() ? "Secure Search activation was denied" : std::move(error);
-    }
-}
-
-void open_enterprise_url_linux() {
-    const pid_t pid = fork();
-    if (pid == 0) {
-        execlp("xdg-open", "xdg-open", such::security::kEnterpriseSecurityUrl, static_cast<char*>(nullptr));
-        _exit(127);
-    }
+    draw_utf8(d, w, gc, static_cast<int>(r.x + dip_px(state, 2.0f)),
+              static_cast<int>(r.y + r.height * 0.5f + dip_px(state, 5.0f)), "Indexing...");
 }
 
 void draw(Display* d, Window w, GC gc, UiState& state) {
@@ -685,10 +757,10 @@ void draw(Display* d, Window w, GC gc, UiState& state) {
     XDrawLine(d, w, gc, static_cast<int>(sr.x + 8), static_cast<int>(sr.y + 1), static_cast<int>(sr.x + sr.width - 8), static_cast<int>(sr.y + 1));
     draw_search_glyph(d, w, gc, static_cast<int>(sr.x + dip_px(state, 20.0f)), static_cast<int>(sr.y + sr.height / 2), state.ui_scale, command_glyph);
     set_color(d, gc, command_text);
-    const std::string label = state.query.empty() ? "2026 Heritage Inc." : state.query;
+    const std::string label = state.query.empty() ? "2026 Heritage Inc.   //drive  Choose indexed drive or folder" : state.query;
     draw_utf8(d, w, gc, static_cast<int>(sr.x + dip_px(state, 39.0f)), static_cast<int>(sr.y + sr.height / 2 + dip_px(state, 5.0f)),
               ellipsize_utf8(label, std::max(8, static_cast<int>(sr.width) - dip_px(state, 58.0f))));
-    draw_security_toggle(d, w, gc, state, layout);
+    draw_indexing_status(d, w, gc, state, layout);
     draw_detail_tree(d, w, gc, state, layout);
 
     const float stride = m.row_height + m.row_gap;
@@ -700,15 +772,11 @@ void draw(Display* d, Window w, GC gc, UiState& state) {
         draw_result(d, w, gc, state.results[static_cast<std::size_t>(i)], row, i, state);
     }
 
-    if (!state.demo && state.query.empty() && draw_status.indexing) {
-        set_color(d, gc, kPathGreen);
-        const std::string message = "Indexing files... " + std::to_string(draw_status.indexed_files);
-        draw_utf8(d, w, gc, static_cast<int>(layout.results_viewport.x), static_cast<int>(layout.results_viewport.y + 28), message);
-    } else if (!state.query.empty() && state.results.empty() && state.suggestions.empty()) {
+    if (!state.query.empty() && state.results.empty() && state.suggestions.empty()) {
         set_color(d, gc, kPathGreen);
         const std::string message = !state.search_error.empty()
             ? "Search error: " + state.search_error
-            : ((!state.demo && draw_status.indexing) ? "Indexing files..." : "No matches");
+            : ((!state.demo && (draw_status.indexing || state.index_worker.valid())) ? "" : "No matches");
         draw_utf8(d, w, gc, static_cast<int>(layout.results_viewport.x), static_cast<int>(layout.results_viewport.y + 28),
                   ellipsize_utf8(message, std::max(8, static_cast<int>(layout.results_viewport.width) - dip_px(state, 16.0f))));
     }
@@ -743,7 +811,6 @@ void draw(Display* d, Window w, GC gc, UiState& state) {
         }
     }
 
-    draw_security_notice(d, w, gc, state);
 }
 
 
@@ -787,22 +854,7 @@ bool execute_font_command_linux(Display* d, UiState& state) {
 }
 
 
-std::optional<std::filesystem::path> default_index_root_linux() {
-    const char* home = std::getenv("HOME");
-    std::filesystem::path candidate;
-    if (home != nullptr && *home != '\0') {
-        candidate = home;
-    } else if (const passwd* pw = ::getpwuid(::getuid()); pw != nullptr && pw->pw_dir != nullptr) {
-        candidate = pw->pw_dir;
-    }
-
-    if (candidate.empty() || candidate == std::filesystem::path("/")) return std::nullopt;
-    std::error_code ec;
-    if (!std::filesystem::is_directory(candidate, ec) || ec) return std::nullopt;
-    return candidate;
-}
-
-bool bootstrap_default_index_root_linux(UiState& state) {
+bool prepare_startup_index_roots_linux(UiState& state) {
     std::string roots_error;
     const auto persisted = state.runtime.roots(&roots_error);
     if (!roots_error.empty()) {
@@ -813,40 +865,39 @@ bool bootstrap_default_index_root_linux(UiState& state) {
     std::vector<std::filesystem::path> valid_roots;
     valid_roots.reserve(persisted.size());
     for (const auto& value : persisted) {
-        std::error_code ec;
         const std::filesystem::path path(value);
-        if (std::filesystem::is_directory(path, ec) && !ec) valid_roots.push_back(path);
-        else std::fprintf(stderr, "Such: stale search root will be removed: %s\n", value.c_str());
-    }
-
-    // Persisted user choices are authoritative. Repair the root set in one
-    // mutation so startup never launches N asynchronous crawls for N stale roots.
-    if (valid_roots.empty()) {
-        const auto default_root = default_index_root_linux();
-        if (default_root.has_value()) valid_roots.push_back(*default_root);
+        if (such::platform::linuxui::index_root_accessible(path)) valid_roots.push_back(path);
+        else std::fprintf(stderr, "Such: inaccessible or stale search root will be removed: %s\n", value.c_str());
     }
 
     std::vector<std::string> desired_roots;
     desired_roots.reserve(valid_roots.size());
     for (const auto& root : valid_roots) desired_roots.push_back(root.string());
     const bool changed = desired_roots != persisted;
-    if (!changed) return true;
+
+    // A fresh Linux install must ask the user which directory to search. HOME
+    // is a candidate in the built-in picker, not an implicit indexing choice.
+    // The same rule applies when every persisted root has become stale.
     if (valid_roots.empty()) {
-        std::string error;
-        if (!state.runtime.replace_roots({}, &error)) {
-            std::fprintf(stderr, "Such: could not clear invalid Linux search roots: %s\n", error.c_str());
-            return false;
+        state.initial_root_picker = true;
+        state.query = "//drive";
+        refresh_query(state);
+        if (changed) {
+            // Clear stale persisted roots through the worker ownership boundary.
+            // An actually fresh install has nothing to mutate and needs no worker.
+            state.startup_worker_request = such::runtime::IndexWorkerRequest{
+                such::runtime::IndexWorkerOperation::ReplaceRoots, {}};
         }
-        std::fprintf(stderr, "Such: no safe default Linux index root was found; use //drive and choose a mounted folder.\n");
-        return false;
+        std::fprintf(stderr, "Such: choose the first Linux search folder in the //drive picker.\n");
+        return true;
     }
 
-    std::string error;
-    if (!state.runtime.replace_roots(valid_roots, &error)) {
-        std::fprintf(stderr, "Such: could not repair Linux search roots: %s\n", error.c_str());
-        return false;
+    state.initial_root_picker = false;
+    if (changed) {
+        // Repair a partially stale root set in one worker-owned mutation.
+        state.startup_worker_request = such::runtime::IndexWorkerRequest{
+            such::runtime::IndexWorkerOperation::ReplaceRoots, valid_roots};
     }
-    if (persisted.empty()) std::fprintf(stderr, "Such: active Linux index root: %s\n", valid_roots.front().string().c_str());
     return true;
 }
 
@@ -892,25 +943,25 @@ bool execute_index_command_linux(UiState& state) {
                 return true;
             }
 
-            std::error_code ec;
-            if (!std::filesystem::is_directory(*root, ec) || ec) {
-                state.suggestions = {{state.query, "Folder is not mounted or is not accessible"}};
+            if (!such::platform::linuxui::index_root_accessible(*root)) {
+                state.suggestions = {{state.query, "Folder is not mounted or current user lacks read/search permission"}};
                 return true;
             }
 
-            const bool ok = command.kind == such::ui::IndexCommandKind::AddRoot
-                ? state.runtime.add_root(*root, &error)
-                : state.runtime.replace_roots({*root}, &error);
-            if (!ok) {
-                state.suggestions = {{state.query, error.empty() ? "Could not use this search folder" : error}};
+            const auto worker_operation = command.kind == such::ui::IndexCommandKind::AddRoot
+                ? such::runtime::IndexWorkerOperation::AddRoot
+                : such::runtime::IndexWorkerOperation::ReplaceRoots;
+            if (!start_index_worker_linux(
+                    state, {worker_operation, {*root}},
+                    command.kind == such::ui::IndexCommandKind::AddRoot ? "Folder indexing" : "Search-folder change",
+                    &error)) {
+                state.suggestions = {{state.query, error.empty() ? "Could not start search-folder indexing" : error}};
                 return true;
             }
 
-            // add_root/replace_roots already schedule the private runtime's
-            // asynchronous crawl. Do NOT call reindex_async() here: doing so
-            // restarts a whole-drive crawl and can make a real mounted volume
-            // appear permanently empty while two scans run back-to-back.
-            state.runtime_generation = state.runtime.generation();
+            // Root mutation and the resulting crawl are worker-owned. The GUI
+            // only observes persistent generation/status changes.
+            state.initial_root_picker = false;
             state.query.clear();
             state.results.clear();
             state.suggestions.clear();
@@ -920,7 +971,12 @@ bool execute_index_command_linux(UiState& state) {
             return true;
         }
         case such::ui::IndexCommandKind::Reindex:
-            state.runtime.reindex_async();
+            if (!start_index_worker_linux(
+                    state, {such::runtime::IndexWorkerOperation::Reindex, {}},
+                    "Index rebuild", &error)) {
+                state.suggestions = {{state.query, error.empty() ? "Could not start index rebuild" : error}};
+                return true;
+            }
             state.query.clear();
             state.results.clear();
             state.suggestions.clear();
@@ -941,7 +997,6 @@ int main(int argc, char** argv) {
     if (such::cli::should_dispatch_from_gui(argc, argv)) {
         return such::cli::run(argc, argv, such::ui::PlatformDialect::UnixLike);
     }
-    std::signal(SIGCHLD, SIG_IGN);
     UiState state;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--smoke") == 0) state.smoke = true;
@@ -965,10 +1020,15 @@ int main(int argc, char** argv) {
         return 5;
     }
     if (!state.demo && !state.smoke && state.runtime.available()) {
-        // Validate persisted roots on every normal launch. Fresh installs get
-        // HOME; stale roots from older builds/removable mounts are pruned and
-        // HOME is restored only when no valid user root remains.
-        (void)bootstrap_default_index_root_linux(state);
+        std::string state_error;
+        state.daily_state_ready = state.daily_refresh.load(&state_error);
+        if (!state.daily_state_ready) {
+            std::fprintf(stderr, "Such daily refresh disabled: %s\n", state_error.c_str());
+        }
+        // Validate persisted roots on every normal launch. A fresh install or
+        // an all-stale root set opens the built-in //drive picker; Linux never
+        // silently adopts HOME as a search root.
+        (void)prepare_startup_index_roots_linux(state);
     }
     if (!state.demo) {
         const auto status = state.runtime.status();
@@ -977,7 +1037,21 @@ int main(int argc, char** argv) {
         state.runtime_indexing = status.indexing;
         // A loaded runtime may already be restoring/rebuilding its corpus. Only
         // request an explicit rebuild when it is genuinely idle and empty.
-        if (!status.indexing && status.indexed_files == 0 && !status.roots.empty()) state.runtime.reindex_async();
+        if (!state.smoke && !state.startup_worker_request.has_value() &&
+            !status.indexing && status.indexed_files == 0 && !status.roots.empty()) {
+            state.startup_worker_request = such::runtime::IndexWorkerRequest{
+                such::runtime::IndexWorkerOperation::Reindex, {}};
+        }
+    }
+
+    if (std::setlocale(LC_CTYPE, "") == nullptr) {
+        std::fprintf(stderr, "Such: LC_CTYPE locale initialization failed; XIM input may be unavailable.\n");
+    }
+    if (!XSupportsLocale()) {
+        std::fprintf(stderr, "Such: Xlib does not support the active locale; XIM input may be unavailable.\n");
+    }
+    if (XSetLocaleModifiers("") == nullptr) {
+        std::fprintf(stderr, "Such: X locale modifiers could not be initialized; XIM input may be unavailable.\n");
     }
 
     Display* d = XOpenDisplay(nullptr);
@@ -985,8 +1059,6 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "Such: XOpenDisplay failed\n");
         return 2;
     }
-    std::setlocale(LC_CTYPE, "");
-    XSetLocaleModifiers("");
     if (const auto preferred = such::ui::load_font_preference(); preferred) state.font_family = *preferred;
 
     const int screen = DefaultScreen(d);
@@ -1002,20 +1074,35 @@ int main(int argc, char** argv) {
     hints.min_width = dip_px(state, 420.0f);
     hints.min_height = dip_px(state, 390.0f);
     XSetWMNormalHints(d, w, &hints);
-    XSelectInput(d, w, ExposureMask | StructureNotifyMask | KeyPressMask | ButtonPressMask | ButtonReleaseMask | PointerMotionMask | FocusChangeMask);
     Atom wmDelete = XInternAtom(d, "WM_DELETE_WINDOW", False);
     XSetWMProtocols(d, w, &wmDelete, 1);
     gInputMethod = XOpenIM(d, nullptr, nullptr, nullptr);
-    if (gInputMethod) {
-        gInputContext = XCreateIC(gInputMethod,
-            XNInputStyle, XIMPreeditNothing | XIMStatusNothing,
-            XNClientWindow, w,
-            XNFocusWindow, w,
-            nullptr);
-        // XIC retains its XIM relationship. It is destroyed before the display closes.
+    long event_mask = ExposureMask | StructureNotifyMask | KeyPressMask | ButtonPressMask |
+                      ButtonReleaseMask | PointerMotionMask | FocusChangeMask;
+    if (gInputMethod != nullptr) {
+        gInputContext = create_input_context(w);
+        if (gInputContext != nullptr) {
+            long xim_filter_events = 0;
+            if (XGetICValues(gInputContext, XNFilterEvents, &xim_filter_events, nullptr) == nullptr) {
+                event_mask |= xim_filter_events;
+            }
+        } else {
+            std::fprintf(stderr, "Such: XIM is available but no supported input style was found; falling back to basic X11 key input.\n");
+        }
+    } else {
+        std::fprintf(stderr, "Such: XIM is unavailable; complex text input will fall back to direct key input.\n");
     }
+    XSelectInput(d, w, event_mask);
     XMapWindow(d, w);
     GC gc = XCreateGC(d, w, 0, nullptr);
+    if (state.startup_worker_request.has_value()) {
+        std::string worker_error;
+        if (!start_index_worker_linux(state, *state.startup_worker_request, "Startup root repair", &worker_error)) {
+            state.search_error = "Could not start background indexing: " + worker_error;
+            std::fprintf(stderr, "Such: %s\n", state.search_error.c_str());
+        }
+        state.startup_worker_request.reset();
+    }
 
     bool running = true;
     int exposes = 0;
@@ -1031,6 +1118,10 @@ int main(int argc, char** argv) {
             if (poll_result < 0) {
                 std::fprintf(stderr, "Such: X11 event poll failed.\n");
                 break;
+            }
+
+            if (poll_index_worker_linux(state)) {
+                draw(d, w, gc, state);
             }
 
             // Indexing is asynchronous. The old Linux loop blocked forever in
@@ -1050,11 +1141,29 @@ int main(int argc, char** argv) {
                     draw(d, w, gc, state);
                 }
             }
+            if (!state.demo && !state.smoke && state.daily_state_ready &&
+                state.runtime.available() && !state.index_worker.valid() && !state.runtime_indexing &&
+                state.daily_refresh.due(such::runtime::DailyIndexRefresh::utc_now(), true, false)) {
+                std::string roots_error;
+                const auto roots = state.runtime.roots(&roots_error);
+                if (roots_error.empty() && !roots.empty()) {
+                    std::string worker_error;
+                    if (start_index_worker_linux(state,
+                            {such::runtime::IndexWorkerOperation::Reindex, {}},
+                            "Daily index refresh", &worker_error)) {
+                        draw(d, w, gc, state);
+                    } else {
+                        state.search_error = "Daily index refresh failed: " + worker_error;
+                        (void)state.daily_refresh.record_failure(such::runtime::DailyIndexRefresh::utc_now());
+                    }
+                }
+            }
             if (XPending(d) == 0) continue;
         }
 
         XEvent e{};
         XNextEvent(d, &e);
+        if (gInputMethod != nullptr && XFilterEvent(&e, None)) continue;
         switch (e.type) {
             case ConfigureNotify:
                 state.width = e.xconfigure.width;
@@ -1069,20 +1178,22 @@ int main(int argc, char** argv) {
                 }
                 break;
             case KeyPress: {
-                char buf[256]{};
-                KeySym ks{};
-                int n = 0;
-                if (gInputContext) {
-                    Status status{};
-                    n = Xutf8LookupString(gInputContext, &e.xkey, buf, static_cast<int>(sizeof(buf) - 1), &ks, &status);
-                    if (n < 0) n = 0;
-                } else {
-                    n = XLookupString(&e.xkey, buf, static_cast<int>(sizeof(buf) - 1), &ks, nullptr);
-                }
-                if (ks == XK_Escape) {
-                    if (state.security_notice_open) {
-                        state.security_notice_open = false;
-                    } else if (state.swipe.is_open() || !state.suggestions.empty()) {
+                const auto key = lookup_utf8_key(&e.xkey);
+                const KeySym ks = key.keysym;
+                const bool committed_text = has_printable_utf8_commit(key);
+                const bool commit_with_control_key = committed_text &&
+                    (ks == XK_Return || ks == XK_KP_Enter || ks == XK_Escape ||
+                     ks == XK_Tab || ks == XK_Up || ks == XK_Down || ks == XK_BackSpace);
+
+                // Some XIMs return XLookupBoth when the key that commits the
+                // composition is also a control key (most importantly Enter).
+                // Preserve the committed Hangul/CJK text and consume that key
+                // event instead of treating the same Enter as a Such command.
+                if (commit_with_control_key) {
+                    state.query += key.text;
+                    if (state.input_gate.accept(state.query)) refresh_query(state);
+                } else if (ks == XK_Escape) {
+                    if (state.swipe.is_open() || !state.suggestions.empty()) {
                         state.swipe.close();
                         state.suggestions.clear();
                     } else {
@@ -1092,7 +1203,7 @@ int main(int argc, char** argv) {
                     // XIM returns UTF-8. Delete one code point rather than one byte so
                     // Korean/CJK input cannot leave an invalid query buffer.
                     pop_utf8_codepoint(state.query);
-                    refresh_query(state);
+                    if (state.input_gate.accept(state.query)) refresh_query(state);
                 } else if (ks == XK_Tab) {
                     complete_first(state);
                 } else if (ks == XK_Down && !state.results.empty()) {
@@ -1122,9 +1233,9 @@ int main(int argc, char** argv) {
                            state.selected >= 0 && state.selected < static_cast<int>(state.results.size()) &&
                            (ks == XK_p || ks == XK_P)) {
                     perform_action(state, state.selected, such::ui::ResultAction::TogglePin);
-                } else if (n > 0 && static_cast<unsigned char>(buf[0]) >= 0x20) {
-                    state.query.append(buf, buf + n);
-                    refresh_query(state);
+                } else if (committed_text) {
+                    state.query += key.text;
+                    if (state.input_gate.accept(state.query)) refresh_query(state);
                 }
                 draw(d, w, gc, state);
                 break;
@@ -1140,23 +1251,6 @@ int main(int argc, char** argv) {
                     break;
                 }
                 if (e.xbutton.button != Button1) break;
-                if (state.security_notice_open) {
-                    if (point_in_rect(security_notice_contact_button(state), e.xbutton.x, e.xbutton.y)) {
-                        open_enterprise_url_linux();
-                        state.security_notice_open = false;
-                    } else if (point_in_rect(security_notice_cancel_button(state), e.xbutton.x, e.xbutton.y)) {
-                        state.security_notice_open = false;
-                    }
-                    draw(d, w, gc, state);
-                    break;
-                }
-                const auto security_layout = x11_layout(state);
-                if (point_in_rect(security_layout.security, e.xbutton.x, e.xbutton.y)) {
-                    request_security_toggle(state);
-                    state.swipe.close();
-                    draw(d, w, gc, state);
-                    break;
-                }
                 int action_row = -1;
                 such::ui::ResultAction action{};
                 if (hit_swipe_action(state, e.xbutton.x, e.xbutton.y, action_row, action)) {
@@ -1210,6 +1304,7 @@ int main(int argc, char** argv) {
         }
     }
 
+    such::runtime::close_index_worker_ticket(&state.index_worker);
     if (gInputContext) { XDestroyIC(gInputContext); gInputContext = nullptr; }
     if (gInputMethod) { XCloseIM(gInputMethod); gInputMethod = nullptr; }
     if (gFontSet) { XFreeFontSet(d, gFontSet); gFontSet = nullptr; }

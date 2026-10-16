@@ -89,6 +89,8 @@ typedef int (*such_runtime_content_result_callback_v1)(void* user, const such_ru
 
 uint32_t such_runtime_abi_version(void);
 such_runtime_handle_v1 such_runtime_create_v1(const char* state_directory_utf8);
+// Optional ABI-v1 filename snapshot reader; callers must discover dynamically.
+such_runtime_handle_v1 such_runtime_create_readonly_v1(const char* state_directory_utf8);
 void such_runtime_destroy_v1(such_runtime_handle_v1 handle);
 int such_runtime_load_v1(such_runtime_handle_v1 handle);
 const char* such_runtime_last_error_v1(such_runtime_handle_v1 handle);
